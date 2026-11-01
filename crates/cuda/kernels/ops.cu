@@ -357,9 +357,11 @@ GS_EXPORT int gs_kda_scan(float *S, const float *q, const float *k, const float 
 // partial results go to `part` (combined by k_mla_combine), which keeps decode (T=1) parallel.
 constexpr int MLA_HG = 16, MLA_KT = 32;
 
-template <int R>
-__global__ void __launch_bounds__(256) k_mla_flash(const float *q, const half *C, const int *sel, int sel_stride,
-                                                   const int *cnt, float scale, float *o, float *part, int H, int splits) {
+// Latent cache formats: f16 [ctx][R], or Q8 = int8 [ctx][R] + f16 scale per 32 values [ctx][R/32].
+template <int R, bool Q8>
+__global__ void __launch_bounds__(256) k_mla_flash(const float *q, const void *C, const half *Cs, const int *sel,
+                                                   int sel_stride, const int *cnt, float scale, float *o, float *part,
+                                                   int H, int splits) {
     constexpr int RC = R / 256;
     const int split = blockIdx.x, hg = blockIdx.y, t = blockIdx.z;
     const int h0 = hg * MLA_HG;
@@ -389,11 +391,30 @@ __global__ void __launch_bounds__(256) k_mla_flash(const float *q, const half *C
         const int nk = min(MLA_KT, s1 - kb);
         if (tid < MLA_KT) sidx[tid] = tid < nk ? srow[kb + tid] : 0;
         __syncthreads();
-        for (int i = tid; i < MLA_KT * R / 8; i += 256) {
-            const int kk = i / (R / 8), c = i % (R / 8);
-            uint4 val = make_uint4(0, 0, 0, 0);
-            if (kk < nk) val = ((const uint4 *) (C + (int64_t) sidx[kk] * R))[c];
-            ((uint4 *) (sc + kk * R))[c] = val;
+        if constexpr (Q8) {
+            // 16 int8 per thread-iteration -> 16 halves, scaled by the block's f16 scale
+            for (int i = tid; i < MLA_KT * R / 16; i += 256) {
+                const int kk = i / (R / 16), c = i % (R / 16);
+                half2 *dst = (half2 *) (sc + kk * R + c * 16);
+                if (kk < nk) {
+                    const int64_t row = sidx[kk];
+                    const uint4 v = ((const uint4 *) ((const int8_t *) C + row * R))[c];
+                    const float d = __half2float(Cs[row * (R / 32) + c / 2]);
+                    const int8_t *b = (const int8_t *) &v;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) dst[j] = __floats2half2_rn(d * b[2 * j], d * b[2 * j + 1]);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; j++) dst[j] = __floats2half2_rn(0.f, 0.f);
+                }
+            }
+        } else {
+            for (int i = tid; i < MLA_KT * R / 8; i += 256) {
+                const int kk = i / (R / 8), c = i % (R / 8);
+                uint4 val = make_uint4(0, 0, 0, 0);
+                if (kk < nk) val = ((const uint4 *) ((const half *) C + (int64_t) sidx[kk] * R))[c];
+                ((uint4 *) (sc + kk * R))[c] = val;
+            }
         }
         __syncthreads();
         for (int kk = warp * 4; kk < warp * 4 + 4; kk++) {
@@ -488,18 +509,44 @@ __global__ void k_mla_combine(const float *part, float *o, int H, int splits) {
 static size_t mla_smem(int R) { return (size_t) MLA_HG * R * 4 + MLA_KT * R * 2 + MLA_HG * MLA_KT * 4 + 3 * MLA_HG * 4 + MLA_KT * 4; }
 
 // part must hold T * (H/16) * splits * (16*R + 32) floats when splits > 1.
-GS_EXPORT int gs_mla_attn(const float *q, const void *C, const int *sel, int sel_stride, const int *cnt, float scale,
-                          float *o, float *part, int T, int H, int R, int splits, void *s) {
+GS_EXPORT int gs_mla_attn(const float *q, const void *C, const void *C_scales, const int *sel, int sel_stride,
+                          const int *cnt, float scale, float *o, float *part, int T, int H, int R, int splits, void *s) {
     if (R != 512 || H % MLA_HG != 0 || splits < 1) return (int) cudaErrorInvalidValue;
     const size_t sm = mla_smem(R);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(k_mla_flash<512>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+        cudaFuncSetAttribute(k_mla_flash<512, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+        cudaFuncSetAttribute(k_mla_flash<512, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
         attr = true;
     }
     dim3 grid(splits, H / MLA_HG, T);
-    k_mla_flash<512><<<grid, 256, sm, (cudaStream_t) s>>>(q, (const half *) C, sel, sel_stride, cnt, scale, o, part, H, splits);
+    if (C_scales)
+        k_mla_flash<512, true><<<grid, 256, sm, (cudaStream_t) s>>>(q, C, (const half *) C_scales, sel, sel_stride, cnt, scale,
+                                                                    o, part, H, splits);
+    else
+        k_mla_flash<512, false><<<grid, 256, sm, (cudaStream_t) s>>>(q, C, nullptr, sel, sel_stride, cnt, scale, o, part, H,
+                                                                     splits);
     if (splits > 1) k_mla_combine<512><<<dim3(H, T), 256, 0, (cudaStream_t) s>>>(part, o, H, splits);
+    return (int) cudaGetLastError();
+}
+
+// Q8 latent rows: per block of 32 values, d = amax / 127, q = round(x / d)
+__global__ void k_quant_q8_rows(const float *x, int8_t *q, half *d, int64_t n_blocks) {
+    const int64_t b = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (b >= n_blocks) return;
+    const float v = x[b * 32 + lane];
+    const float amax = warp_max(fabsf(v));
+    const float dd = amax / 127.f;
+    const float inv = dd > 0.f ? 1.f / dd : 0.f;
+    q[b * 32 + lane] = (int8_t) __float2int_rn(v * inv);
+    if (lane == 0) d[b] = __float2half(dd);
+}
+GS_EXPORT int gs_quant_q8_rows(const float *x, void *q, void *d, int64_t n, void *s) {
+    if (n % 32 != 0) return (int) cudaErrorInvalidValue;
+    const int64_t nb = n / 32;
+    if (nb == 0) return 0;
+    k_quant_q8_rows<<<(unsigned) ((nb + 7) / 8), 256, 0, (cudaStream_t) s>>>(x, (int8_t *) q, (half *) d, nb);
     return (int) cudaGetLastError();
 }
 

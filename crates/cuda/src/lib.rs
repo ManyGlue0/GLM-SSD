@@ -84,8 +84,9 @@ pub mod ffi {
             state: *mut f32, q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta_logit: *const f32, out: *mut f32,
             t: i32, h: i32, d: i32, save_at: i32, s_save: *mut f32, s: *mut c_void,
         ) -> i32;
+        pub fn gs_quant_q8_rows(x: *const f32, q: *mut c_void, d: *mut c_void, n: i64, s: *mut c_void) -> i32;
         pub fn gs_mla_attn(
-            q: *const f32, c: *const c_void, sel: *const i32, sel_stride: i32, cnt: *const i32, scale: f32, o: *mut f32,
+            q: *const f32, c: *const c_void, c_scales: *const c_void, sel: *const i32, sel_stride: i32, cnt: *const i32, scale: f32, o: *mut f32,
             part: *mut f32, t: i32, h: i32, r: i32, splits: i32, s: *mut c_void,
         ) -> i32;
         pub fn gs_idx_pool(

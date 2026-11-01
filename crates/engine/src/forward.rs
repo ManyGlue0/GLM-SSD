@@ -98,7 +98,8 @@ struct MtpHead {
 
 enum LayerState {
     Kda { s: DeviceBuffer, conv: DeviceBuffer, s_save: Option<DeviceBuffer>, conv_save: Option<DeviceBuffer> },
-    Mla { latent: DeviceBuffer, pooled: DeviceBuffer, ring_k: DeviceBuffer, ring_g: DeviceBuffer },
+    /// latent: f16 [ctx][R], or int8 [ctx][R] with `scales` f16 [ctx][R/32] (Q8 cache)
+    Mla { latent: DeviceBuffer, scales: Option<DeviceBuffer>, pooled: DeviceBuffer, ring_k: DeviceBuffer, ring_g: DeviceBuffer },
 }
 
 /// Which rows of a forward call produce logits.
@@ -120,6 +121,11 @@ pub struct EngineOpts {
     pub ctx: usize,
     pub chunk: usize,
     pub mtp: bool,
+    /// store MLA latents as Q8 (int8 + f16 scale per 32) instead of f16
+    pub kv_q8: bool,
+    /// decode: swap an expert that would need an SSD read for a cached one whose routing
+    /// score is within this margin (0 = exact routing)
+    pub cache_aware: f32,
     pub cache: CacheConfig,
 }
 
@@ -157,6 +163,8 @@ pub struct Engine {
     pub mtp_pos: usize,
     pub trace: bool,
     pub timings: Timings,
+    pub cache_aware: f32,
+    pub swaps: u64,
     // per-call position of the first row (for MLA / indexer), and the layer being run
     p0: usize,
 
@@ -263,10 +271,19 @@ impl Engine {
                     }))
                 }
                 AttnKind::Mla => {
-                    let latent = DeviceBuffer::new(ctx * cfg.kv_lora_rank * 2).context("MLA latent cache")?;
+                    let r = cfg.kv_lora_rank;
+                    let latent = DeviceBuffer::new(ctx * r * if o.kv_q8 { 1 } else { 2 }).context("MLA latent cache")?;
                     latent.zero(&s)?;
+                    let scales = if o.kv_q8 {
+                        let b = DeviceBuffer::new(ctx * (r / 32) * 2).context("MLA latent scales")?;
+                        b.zero(&s)?;
+                        Some(b)
+                    } else {
+                        None
+                    };
                     states.push(LayerState::Mla {
                         latent,
+                        scales,
                         pooled: fbuf((ctx / cfg.idx_kpool + 1) * cfg.idx_head_dim, &s)?,
                         ring_k: fbuf(cfg.idx_kpool * cfg.idx_head_dim, &s)?,
                         ring_g: fbuf(cfg.idx_kpool * cfg.idx_head_dim, &s)?,
@@ -397,6 +414,8 @@ impl Engine {
             mtp_pos: 0,
             trace: false,
             timings: Timings::default(),
+            cache_aware: o.cache_aware,
+            swaps: 0,
             p0: 0,
             experts: {
                 // whatever the budget leaves after weights, caches and scratch goes to experts
@@ -625,7 +644,7 @@ impl Engine {
         let c = &self.cfg;
         let (h, dq, r) = (c.n_head, c.mla_head_k, c.kv_lora_rank);
         let (dk, kp) = (c.idx_head_dim, c.idx_kpool);
-        let LayerState::Mla { latent, pooled, ring_k, ring_g } = &self.states[il] else { unreachable!() };
+        let LayerState::Mla { latent, scales, pooled, ring_k, ring_g } = &self.states[il] else { unreachable!() };
         let p0 = self.p0;
         if p0 + t > self.ctx {
             bail!("context full ({} tokens)", self.ctx);
@@ -639,8 +658,18 @@ impl Engine {
         // latents of these positions -> f16 cache
         self.mm(&w.kv_a, xn, kv, t)?;
         self.rms(kv, Some(&w.kv_a_norm), kv, t, r)?;
-        let lat = (latent.ptr() as *mut u8).wrapping_add(p0 * r * 2);
-        ck!(ffi::gs_f32_to_f16(kv, lat as _, (t * r) as i64, self.s.raw()));
+        match scales {
+            Some(sc) => {
+                let lat = (latent.ptr() as *mut u8).wrapping_add(p0 * r);
+                let d = (sc.ptr() as *mut u8).wrapping_add(p0 * (r / 32) * 2);
+                ck!(ffi::gs_quant_q8_rows(kv, lat as _, d as _, (t * r) as i64, self.s.raw()));
+            }
+            None => {
+                let lat = (latent.ptr() as *mut u8).wrapping_add(p0 * r * 2);
+                ck!(ffi::gs_f32_to_f16(kv, lat as _, (t * r) as i64, self.s.raw()));
+            }
+        }
+        let lat_scales = scales.as_ref().map_or(std::ptr::null_mut(), |b| b.ptr());
         // indexer keys / gates of these positions, pooled when a pool of `kp` completes
         let (kc, gc) = (self.b.f32(), self.b.f32().wrapping_add(t * dk));
         self.mm(&w.ik, xn, kc, t)?;
@@ -681,7 +710,7 @@ impl Engine {
             self.mm_heads(&w.k_b, q.wrapping_add(t0 * h * dq), h * dq, dq, self.qabs.f32(), h * r, r, tn)?;
             let splits = if tn == 1 { 16 } else if tn <= 8 { 4 } else { 1 };
             ck!(ffi::gs_mla_attn(
-                self.qabs.f32(), latent.ptr(), sel.wrapping_add(t0 * self.sel_stride), self.sel_stride as i32,
+                self.qabs.f32(), latent.ptr(), lat_scales, sel.wrapping_add(t0 * self.sel_stride), self.sel_stride as i32,
                 cnt.wrapping_add(t0), 1.0 / (dq as f32).sqrt(), self.olat.f32(), self.part.f32(), tn as i32, h as i32,
                 r as i32, splits, self.s.raw()
             ));
@@ -699,6 +728,46 @@ impl Engine {
         self.mm(up, x, u, t)?;
         ck!(ffi::gs_swiglu(g, u, g, (t * gate.d1) as i64, lim, self.s.raw()));
         self.mm(down, g, out, t)
+    }
+
+    /// Routing with cache-aware substitution (decode only): chosen experts of rank 3-8 that are
+    /// not resident are replaced by the best resident unchosen expert whose selection score is
+    /// within `cache_aware` of theirs. Weights are recomputed over the final set.
+    fn route_cached(&mut self, il: usize, bias: &[f32], logits: &[f32], t: usize) -> Vec<Vec<(u16, f32)>> {
+        let m = self.cache_aware;
+        if m <= 0.0 || t > 2 {
+            return self.route(bias, logits, t);
+        }
+        let c = &self.cfg;
+        let ne = c.n_expert;
+        let k = c.n_expert_used;
+        let mut swaps = 0;
+        let out = (0..t)
+            .map(|ti| {
+                let l = &logits[ti * ne..(ti + 1) * ne];
+                let scores: Vec<f32> = l.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+                let sel = |e: usize| scores[e] + bias[e];
+                let mut order: Vec<usize> = (0..ne).collect();
+                order.sort_by(|a, b| sel(*b).total_cmp(&sel(*a)));
+                let mut chosen: Vec<usize> = order[..k].to_vec();
+                let mut spare: Vec<usize> =
+                    order[k..].iter().copied().filter(|&e| self.experts.resident(il, e as u16)).collect();
+                for j in 2..k {
+                    let e = chosen[j];
+                    if self.experts.resident(il, e as u16) {
+                        continue;
+                    }
+                    if let Some(pos) = spare.iter().position(|&cand| sel(cand) >= sel(e) - m) {
+                        chosen[j] = spare.remove(pos);
+                        swaps += 1;
+                    }
+                }
+                let wsum: f32 = if c.expert_weights_norm { chosen.iter().map(|e| scores[*e]).sum() } else { 1.0 };
+                chosen.iter().map(|&e| (e as u16, scores[e] / (wsum + 1e-20) * c.expert_weights_scale)).collect()
+            })
+            .collect();
+        self.swaps += swaps;
+        out
     }
 
     /// Host-side routing: per token the chosen experts and their weights.
@@ -735,7 +804,7 @@ impl Engine {
         let mut logits = vec![0f32; t * ne];
         self.router.download(0, bytes_of_mut(&mut logits), &self.s)?;
         self.s.sync()?;
-        let routes = self.route(&bias, &logits, t);
+        let routes = self.route_cached(il, &bias, &logits, t);
         if self.trace {
             let r = &routes[t - 1];
             eprintln!(

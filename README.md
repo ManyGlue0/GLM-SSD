@@ -51,6 +51,8 @@ Useful options:
 | `--preload` | fill the expert caches from the learned hot-expert profile at start |
 | `--profile FILE` / `--no-profile` | where usage statistics are kept (default `hot-experts.txt`) |
 | `--prefetch K` | prefetch K predicted experts of the next layer while decoding (default 2) |
+| `--cache-aware M` | cache-aware routing: an uncached expert of rank 3-8 is replaced by a cached one whose routing score is within M (default 0 = exact). 0.1 = +65% decode speed at unchanged perplexity on our test; 0.2 = +95% at +1.3% perplexity |
+| `--kv-cache q8` | store the context (MLA latents) as Q8: 47% smaller (~0.85 GB saved at 128K), no measurable quality change |
 | `--snapshots N` | prompt-cache snapshots kept in RAM (~150 MB each) |
 | `--temp --top-p --top-k --min-p --seed` | sampling |
 
@@ -61,12 +63,14 @@ mapped to GLM's `<tool_call>` XML), `reasoning_effort`, `stop`, and `stream_opti
 Requests are served one at a time; consecutive requests that share a prefix (multi-turn chats,
 agent loops) reuse it.
 
-Diagnostics: `glm-ssd inspect`, `qtest`, `qbench`, `iobench`, `tokenize`, `template`, `run --trace`
+Diagnostics: `glm-ssd ppl --file text.txt` (perplexity + speed in decode mode, to compare
+options), `inspect`, `qtest`, `qbench`, `iobench`, `tokenize`, `template`, `run --trace`
 (compare with `llama-eval-callback`), `ref-l0` (f64 CPU reference of layer 0).
 
 ## Performance (RTX 3090 + Samsung 990 PRO, 22G / 12G budgets)
 
 | | |
 |---|---|
-| decode | ~5.6 tok/s, ~5.9 tok/s with `--mtp` |
+| decode, exact routing | ~5.6 tok/s, ~5.9 tok/s with `--mtp` |
+| decode, `--mtp --cache-aware 0.1` | ~9.4 tok/s |
 | prefill | ~60 tok/s (chunk 1024), ~120 tok/s (chunk 2048) |

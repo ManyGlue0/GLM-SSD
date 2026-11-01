@@ -94,6 +94,13 @@ struct EngineArgs {
     /// Max prompt-cache snapshots kept in RAM (~150 MB each)
     #[arg(long, default_value_t = 6)]
     snapshots: usize,
+    /// Context (MLA latent) cache format: f16, or q8 (47% smaller, tiny precision loss)
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+    kv_cache: String,
+    /// Decode: replace an uncached routed expert (rank 3-8) by a cached one whose routing score is
+    /// within this margin (0 = exact routing; trades a little quality for fewer SSD reads)
+    #[arg(long, default_value_t = 0.0)]
+    cache_aware: f32,
     /// Decode: prefetch this many of the next layer's predicted experts (0 = off)
     #[arg(long, default_value_t = 2)]
     prefetch: usize,
@@ -205,6 +212,21 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 200)]
         n_gen: usize,
     },
+    /// Quality + speed under decode conditions: prefill the first tokens of a text, then feed the
+    /// rest one token at a time and report the perplexity of each next token
+    Ppl {
+        #[command(flatten)]
+        eng: EngineArgs,
+        /// Text file
+        #[arg(long)]
+        file: PathBuf,
+        /// Tokens prefilled before measuring
+        #[arg(long, default_value_t = 64)]
+        warm: usize,
+        /// Tokens scored in decode mode
+        #[arg(short = 'n', long, default_value_t = 300)]
+        n: usize,
+    },
     /// f64 CPU reference of layer 0 (KDA + mHC) for one token, to arbitrate GPU vs llama.cpp
     RefL0 {
         #[command(flatten)]
@@ -298,6 +320,7 @@ fn main() -> Result<()> {
             run(&eng, tokens.as_deref(), prompt.as_deref(), n_predict, sequential, trace, top)?
         }
         Cmd::Bench { eng, message, n_gen } => bench(&eng, &message, n_gen)?,
+        Cmd::Ppl { eng, file, warm, n } => ppl(&eng, &file, warm, n)?,
         Cmd::Chat { eng, sample, system, effort, hide_think, max_tokens } => {
             chat_repl(&eng, &sample, system, effort, hide_think, max_tokens)?
         }
@@ -358,6 +381,8 @@ fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
         ctx: a.ctx,
         chunk: a.chunk,
         mtp: a.mtp,
+        kv_q8: a.kv_cache == "q8",
+        cache_aware: a.cache_aware,
         cache: experts::CacheConfig {
             prefetch: a.prefetch,
             vram_bytes: vram,
@@ -596,5 +621,49 @@ fn bench(a: &EngineArgs, message: &str, n_gen: usize) -> Result<()> {
     println!("{}", sess.eng.experts.summary());
     let _ = snap;
     sess.eng.experts.save_profile()?;
+    Ok(())
+}
+
+fn ppl(a: &EngineArgs, file: &std::path::Path, warm: usize, n: usize) -> Result<()> {
+    let (g, mut sess) = start(a)?;
+    let vocab = tokenizer::Vocab::from_gguf(&g)?;
+    let text = std::fs::read_to_string(file)?;
+    let mut toks = vocab.encode("[gMASK]<sop>", true);
+    toks.extend(vocab.encode(&text, false));
+    anyhow::ensure!(toks.len() > warm + 1, "text too short ({} tokens)", toks.len());
+    let end = (warm + n).min(toks.len() - 1);
+    let eng = &mut sess.eng;
+    let mut logits = eng.forward(&toks[..warm], forward::Rows::Last, false)?.pop().unwrap();
+    let s0 = eng.experts.stats.clone();
+    let t0 = std::time::Instant::now();
+    let (mut nll, mut top1) = (0f64, 0usize);
+    for i in warm..=end {
+        let target = toks[i] as usize;
+        let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let lse = mx as f64 + logits.iter().map(|x| ((x - mx) as f64).exp()).sum::<f64>().ln();
+        nll += lse - logits[target] as f64;
+        top1 += (session::Sampler::greedy(&logits) as usize == target) as usize;
+        if i == end {
+            break;
+        }
+        logits = eng.forward(&toks[i..i + 1], forward::Rows::Last, false)?.pop().unwrap();
+    }
+    let scored = end - warm + 1;
+    let dt = t0.elapsed().as_secs_f64();
+    let s = &eng.experts.stats;
+    let uses = (s.uses - s0.uses).max(1) as f64;
+    println!(
+        "ppl {:.4} | top-1 {:.1}% | {} tokens in {:.1}s = {:.2} tok/s | VRAM {:.1}% RAM {:.1}% SSD {:.1}% | {:.1} GB read | swaps {}",
+        (nll / scored as f64).exp(),
+        100.0 * top1 as f64 / scored as f64,
+        scored,
+        dt,
+        (scored - 1) as f64 / dt,
+        100.0 * (s.hit_vram - s0.hit_vram) as f64 / uses,
+        100.0 * (s.hit_ram - s0.hit_ram) as f64 / uses,
+        100.0 * (s.miss - s0.miss) as f64 / uses,
+        (s.read_bytes - s0.read_bytes) as f64 / 1e9,
+        eng.swaps
+    );
     Ok(())
 }

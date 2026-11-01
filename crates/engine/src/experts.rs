@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 pub type Key = (u16, u16); // (layer, expert)
 
-/// Per-token decay of the use frequency (half-life ~350 tokens).
-const DECAY: f32 = 0.998;
+/// Per-token decay of the use frequency (default half-life ~350 tokens; GLMSSD_DECAY overrides).
+const DECAY_DEFAULT: f32 = 0.998;
 /// Minimum slots per size class in each tier (enough to pipeline one layer).
 const MIN_SLOTS: usize = 24;
 /// Slots allocated per pinned / device chunk.
@@ -235,6 +235,7 @@ pub struct ExpertCache {
     loading: HashMap<u64, (usize, usize, u8)>, // request id -> (class, ram slot, extents left)
     prefetch_ids: HashSet<u64>,
     pub prefetch_k: usize,
+    decay: f32,
     io: IoPool,
     now: u64,
     pub stats: Stats,
@@ -308,6 +309,7 @@ impl ExpertCache {
             loading: HashMap::new(),
             prefetch_ids: HashSet::new(),
             prefetch_k: cfg.prefetch,
+            decay: std::env::var("GLMSSD_DECAY").ok().and_then(|v| v.parse().ok()).unwrap_or(DECAY_DEFAULT),
             io,
             now: 0,
             stats: Stats::default(),
@@ -390,12 +392,13 @@ impl ExpertCache {
     fn score(&self, k: Key) -> f32 {
         let (f, last) = self.freq.get(&k).copied().unwrap_or((0.0, 0));
         let p = self.prior.get(&k).copied().unwrap_or(0.0);
-        f * DECAY.powi((self.now - last).min(1 << 20) as i32) + p
+        f * self.decay.powi((self.now - last).min(1 << 20) as i32) + p
     }
     fn touch(&mut self, k: Key) {
         let now = self.now;
+        let decay = self.decay;
         let e = self.freq.entry(k).or_insert((0.0, now));
-        e.0 = e.0 * DECAY.powi((now - e.1).min(1 << 20) as i32) + 1.0;
+        e.0 = e.0 * decay.powi((now - e.1).min(1 << 20) as i32) + 1.0;
         e.1 = now;
         *self.counts.entry(k).or_insert(0) += 1;
     }
@@ -665,6 +668,12 @@ impl ExpertCache {
             self.classes[c].vram[v].last_use.record(compute)?;
         }
         Ok(())
+    }
+
+    /// Is this expert in either tier (or already being read)?
+    pub fn resident(&self, layer: usize, e: u16) -> bool {
+        let k = (layer as u16, e);
+        self.vram_map.contains_key(&k) || self.ram_map.contains_key(&k)
     }
 
     /// Speculatively start reading experts that are likely needed soon (low priority).

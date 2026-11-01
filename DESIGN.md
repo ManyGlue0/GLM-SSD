@@ -150,6 +150,23 @@ much of the remaining SSD traffic can be hidden behind compute.
 | long context | needles retrieved at 3.5K and 17K tokens (sparse DSA path), ctx 131072 |
 | expert hit rate (decode) | ~60% VRAM + ~14% RAM, rest from SSD at ~6 GB/s |
 
+### Speed vs quality options (decode, `glm-ssd ppl` on 300 tokens of prose, exact = 3.9917 ppl)
+
+Exact routing is deterministic, so the perplexity differences below are real, not noise.
+
+| option | decode | ppl | SSD share of expert uses |
+|---|---|---|---|
+| exact | 4.54 tok/s | 3.9917 | 23.1% |
+| `--kv-cache q8` | 4.61 | 3.9707 | 23.0% |
+| `--cache-aware 0.05` | 6.42 | 3.9729 | 12.3% |
+| `--cache-aware 0.1` | 7.51 | 3.9944 | 8.1% |
+| `--cache-aware 0.2` | 8.92 | 4.0446 | 4.5% |
+| `--cache-aware 0.4` | 9.68 | 4.0764 | 2.5% |
+| `--mtp --cache-aware 0.1` (bench) | 9.36 | | 14% |
+
+Eviction half-life (GLMSSD_DECAY 0.99 / 0.998 / 0.9995) does not change the hit rate.
+Context memory: 12.7 KB/token with f16 latents (13.8 with MTP) -> 1.7-1.8 GB at 128K; Q8 saves 47%.
+
 Decode is SSD-bandwidth bound (~0.8 GB of expert misses per token); more cache budget is the
 main lever. Prefill streams nearly every expert once per chunk, so bigger chunks are faster.
 
