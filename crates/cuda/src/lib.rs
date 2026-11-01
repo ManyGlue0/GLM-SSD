@@ -73,18 +73,44 @@ pub mod ffi {
         pub fn gs_hc_post(streams: *mut f32, out: *const f32, hcw: *const f32, t: i32, d: i32, s: *mut c_void) -> i32;
         pub fn gs_hc_mean(streams: *const f32, y: *mut f32, t: i32, d: i32, s: *mut c_void) -> i32;
         pub fn gs_hc_expand(x: *const f32, streams: *mut f32, t: i32, d: i32, s: *mut c_void) -> i32;
-        pub fn gs_conv_step(x: *const f32, state: *mut f32, w: *const f32, y: *mut f32, n: i32, k: i32, s: *mut c_void) -> i32;
-        pub fn gs_kda_gate(f: *const f32, dt_b: *const f32, ssm_a: *const f32, g: *mut f32, n: i32, head_dim: i32, lb: f32, s: *mut c_void) -> i32;
-        pub fn gs_kda_step(
-            state: *mut f32, q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta_logit: *const f32, out: *mut f32,
-            h: i32, d: i32, s: *mut c_void,
-        ) -> i32;
-        pub fn gs_mla_attn(
-            q: *const f32, c: *const f32, idx: *const i32, n_sel: i32, scale: f32, scratch: *mut f32, o: *mut f32, h: i32, r: i32,
+        pub fn gs_conv_scan(
+            x: *const f32, state: *mut f32, w: *const f32, y: *mut f32, t: i32, n: i32, k: i32, save_at: i32, save: *mut f32,
             s: *mut c_void,
         ) -> i32;
-        pub fn gs_idx_pool(rows: *const f32, ape: *const f32, p: *mut f32, dk: i32, kpool: i32, s: *mut c_void) -> i32;
-        pub fn gs_idx_score(q: *const f32, w: *const f32, p: *const f32, n_pool: i32, score: *mut f32, hq: i32, dk: i32, scale: f32, s: *mut c_void) -> i32;
+        pub fn gs_kda_gate(
+            f: *const f32, dt_b: *const f32, ssm_a: *const f32, g: *mut f32, n: i64, head_dim: i32, h: i32, lb: f32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_kda_scan(
+            state: *mut f32, q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta_logit: *const f32, out: *mut f32,
+            t: i32, h: i32, d: i32, save_at: i32, s_save: *mut f32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_mla_attn(
+            q: *const f32, c: *const c_void, sel: *const i32, sel_stride: i32, cnt: *const i32, scale: f32, o: *mut f32,
+            part: *mut f32, t: i32, h: i32, r: i32, splits: i32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_idx_pool(
+            kc: *const f32, gc: *const f32, rk: *mut f32, rg: *mut f32, ape: *const f32, p: *mut f32, p0: i32, t: i32, dk: i32,
+            kpool: i32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_idx_score(
+            q: *const f32, w: *const f32, p: *const f32, score: *mut f32, score_stride: i64, pos0: i32, t: i32, kpool: i32,
+            hq: i32, dk: i32, scale: f32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_idx_select(
+            score: *const f32, score_stride: i64, pos0: i32, t: i32, kpool: i32, top_k: i32, sel: *mut i32, sel_stride: i32,
+            cnt: *mut i32, s: *mut c_void,
+        ) -> i32;
+
+        // gemm.cu
+        pub fn gs_gemm(
+            ty: i32, w: *const c_void, row_stride: i64, k: i32, rows: i32, x: *const f32, x_stride: i64, y: *mut f32,
+            y_stride: i64, n: i32, accumulate: i32, n_batch: i32, w_bs: i64, x_bs: i64, y_bs: i64, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_gather_rows(x: *const f32, idx: *const i32, y: *mut f32, rows: i32, n: i32, s: *mut c_void) -> i32;
+        pub fn gs_scatter_add_rows(
+            acc: *mut f32, idx: *const i32, w: *const f32, y: *const f32, rows: i32, n: i32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_f32_to_f16(x: *const f32, y: *mut c_void, n: i64, s: *mut c_void) -> i32;
     }
 }
 
@@ -116,6 +142,12 @@ pub mod ops {
             )
         })
     }
+}
+
+/// Free / total device memory in bytes.
+pub fn mem_info() -> Result<(u64, u64)> {
+    let i = device_info(0)?;
+    Ok((i.free_mem, i.total_mem))
 }
 
 pub fn check(code: i32) -> Result<()> {
@@ -166,6 +198,24 @@ impl Stream {
     pub fn raw(&self) -> *mut c_void {
         self.0
     }
+    /// Make future work on this stream wait for `e`.
+    pub fn wait(&self, e: &Event) -> Result<()> {
+        check(unsafe { ffi::gs_stream_wait_event(self.0, e.0) })
+    }
+    /// Async copy host -> device (host memory should be pinned for true asynchrony).
+    ///
+    /// # Safety
+    /// Both pointers must be valid for `n` bytes until the copy completes.
+    pub unsafe fn h2d(&self, dst: *mut c_void, src: *const u8, n: usize) -> Result<()> {
+        check(ffi::gs_memcpy_h2d(dst, src as _, n, self.0))
+    }
+    /// Async copy device -> device.
+    ///
+    /// # Safety
+    /// Both pointers must be valid device memory for `n` bytes.
+    pub unsafe fn d2d(&self, dst: *mut c_void, src: *const c_void, n: usize) -> Result<()> {
+        check(ffi::gs_memcpy_d2d(dst, src, n, self.0))
+    }
 }
 impl Drop for Stream {
     fn drop(&mut self) {
@@ -173,11 +223,21 @@ impl Drop for Stream {
     }
 }
 
-/// CUDA event with timing enabled.
+/// CUDA event.
 pub struct Event(*mut c_void);
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 impl Event {
+    /// Event without timing (cheap; for stream dependencies).
+    pub fn new() -> Result<Self> {
+        let mut e = std::ptr::null_mut();
+        check(unsafe { ffi::gs_event_create(&mut e) })?;
+        Ok(Self(e))
+    }
+    /// True if all work captured by the last `record` has completed.
+    pub fn done(&self) -> bool {
+        unsafe { ffi::gs_event_query(self.0) == 0 }
+    }
     pub fn timed() -> Result<Self> {
         let mut e = std::ptr::null_mut();
         check(unsafe { ffi::gs_event_create_timed(&mut e) })?;

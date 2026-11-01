@@ -15,3 +15,7 @@ gguf = { path = "../gguf" }
 cuda = { path = "../cuda" }
 quants = { path = "../quants" }
 fancy-regex = "0.14"
+minijinja = { version = "2", features = ["loop_controls", "json", "builtins"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+serde_json = "1"
+tiny_http = "0.12"

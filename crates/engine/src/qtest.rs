@@ -103,11 +103,38 @@ fn check_matrix(ty: GgmlType, raw: &[u8], rows: usize, k: usize, label: &str, rn
             for r in 0..rows {
                 let w = &cpu[r * k..(r + 1) * k];
                 let xv = &x[b * k..(b + 1) * k];
-                want[b * rows + r] = w.iter().zip(xv).map(|(a, b)| (*a as f64 * *b as f64)).sum::<f64>() as f32;
+                want[b * rows + r] = w.iter().zip(xv).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32;
             }
         }
         worst_g = worst_g.max(max_rel_err(&out, &want).0);
     }
+    // tensor-core GEMM over 37 tokens (activations rounded to f16, like the kernel does)
+    let worst_mm = {
+        let nt = 37usize;
+        let x: Vec<f32> = (0..nt * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let xh: Vec<f32> = x.iter().map(|v| quants::f16_to_f32(quants::f32_to_f16(*v))).collect();
+        let dx = DeviceBuffer::new(x.len() * 4)?;
+        dx.upload(0, bytes_of(&x), s)?;
+        let dyy = DeviceBuffer::new(nt * rows * 4)?;
+        cuda::check(unsafe {
+            cuda::ffi::gs_gemm(
+                ty.id() as i32, dw.ptr(), row_stride as i64, k as i32, rows as i32, dx.ptr() as *const f32, k as i64,
+                dyy.ptr() as *mut f32, rows as i64, nt as i32, 0, 1, 0, 0, 0, s.raw(),
+            )
+        })?;
+        let mut out = vec![0f32; nt * rows];
+        dyy.download(0, bytes_of_mut(&mut out), s)?;
+        s.sync()?;
+        let mut want = vec![0f32; nt * rows];
+        for b in 0..nt {
+            for r in 0..rows {
+                let w = &cpu[r * k..(r + 1) * k];
+                let xv = &xh[b * k..(b + 1) * k];
+                want[b * rows + r] = w.iter().zip(xv).map(|(a, b)| quants::f16_to_f32(quants::f32_to_f16(*a)) as f64 * *b as f64).sum::<f64>() as f32;
+            }
+        }
+        max_rel_err(&out, &want).0
+    };
     let absmax = cpu.iter().fold(0f32, |m, v| m.max(v.abs()));
     let distinct = {
         let mut v: Vec<u32> = cpu.iter().map(|f| f.to_bits()).collect();
@@ -116,10 +143,10 @@ fn check_matrix(ty: GgmlType, raw: &[u8], rows: usize, k: usize, label: &str, rn
         v.len()
     };
     // a degenerate decode (all zeros / constant) would trivially "match"
-    let ok = de < 1e-6 && worst_g < 1e-4 && absmax > 0.0 && distinct > 16;
+    let ok = de < 1e-6 && worst_g < 1e-4 && worst_mm < 1e-4 && absmax > 0.0 && distinct > 16;
     println!(
-        "  {:<8} {:<34} dequant err {:.1e}  gemv err {:.1e}  |w|max {:.3e}  {:>7} distinct  {}",
-        format!("{ty:?}"), label, de, worst_g, absmax, distinct, if ok { "OK" } else { "FAIL" }
+        "  {:<8} {:<34} dequant err {:.1e}  gemv err {:.1e}  gemm err {:.1e}  |w|max {:.3e}  {:>7} distinct  {}",
+        format!("{ty:?}"), label, de, worst_g, worst_mm, absmax, distinct, if ok { "OK" } else { "FAIL" }
     );
     if !ok && de >= 1e-6 {
         println!("      first mismatch: gpu {} vs cpu {}", gpu[di], cpu[di]);
@@ -132,9 +159,9 @@ pub fn run(model: Option<&Path>) -> Result<()> {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut all_ok = true;
 
-    println!("random blocks (rows=37, k=4096):");
+    println!("random blocks (rows=101, k=4096):");
     for ty in TYPES {
-        let (rows, k) = (37, 4096);
+        let (rows, k) = (101, 4096);
         let raw = random_blocks(ty, rows * k, &mut rng);
         all_ok &= check_matrix(ty, &raw, rows, k, "random", &mut rng, &s)?;
     }
@@ -145,7 +172,7 @@ pub fn run(model: Option<&Path>) -> Result<()> {
         let g = gguf::Gguf::open_shard(m)?;
         let mut seen = std::collections::HashSet::new();
         for t in &g.tensors {
-            if !quants::is_supported(t.ty) || t.dims.len() < 2 || seen.contains(&t.ty) {
+            if !quants::is_supported(t.ty) || t.dims.len() < 2 || t.dims[0] % 32 != 0 || seen.contains(&t.ty) {
                 continue;
             }
             seen.insert(t.ty);

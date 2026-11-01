@@ -246,32 +246,45 @@ GS_EXPORT int gs_hc_expand(const float *x, float *streams, int T, int D, void *s
 }
 
 // ---- KDA (Glm5NextTextLinearAttention) ------------------------------------------------------------
-// One decode step of the depthwise causal conv (kernel K=4) + SiLU.
-// state: [n][K-1] previous inputs (oldest first), w: [n][K] (w[0] multiplies the oldest input)
-__global__ void k_conv_step(const float *x, float *state, const float *w, float *y, int n, int K) {
+// Depthwise causal conv (kernel K <= 8) + SiLU over T consecutive tokens.
+// x, y: [T][n]; state: [n][K-1] previous inputs (oldest first); w: [n][K] (w[0] multiplies the oldest).
+// If 0 <= save_at < T, the state after token `save_at` is also written to `save` (speculative rollback).
+__global__ void k_conv_scan(const float *x, float *state, const float *w, float *y, int T, int n, int K, int save_at,
+                            float *save) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n) return;
-    float *st = state + (int64_t) c * (K - 1);
-    const float *wc = w + (int64_t) c * K;
-    const float xn = x[c];
-    float acc = wc[K - 1] * xn;
-    for (int j = 0; j < K - 1; j++) acc += wc[j] * st[j];
-    for (int j = 0; j < K - 2; j++) st[j] = st[j + 1];
-    st[K - 2] = xn;
-    y[c] = acc / (1.f + expf(-acc));
+    float st[7], wc[8];
+    for (int j = 0; j < K - 1; j++) st[j] = state[(int64_t) c * (K - 1) + j];
+    for (int j = 0; j < K; j++) wc[j] = w[(int64_t) c * K + j];
+    for (int t = 0; t < T; t++) {
+        const float xn = x[(int64_t) t * n + c];
+        float acc = wc[K - 1] * xn;
+        for (int j = 0; j < K - 1; j++) acc += wc[j] * st[j];
+        for (int j = 0; j < K - 2; j++) st[j] = st[j + 1];
+        st[K - 2] = xn;
+        y[(int64_t) t * n + c] = acc / (1.f + expf(-acc));
+        if (t == save_at)
+            for (int j = 0; j < K - 1; j++) save[(int64_t) c * (K - 1) + j] = st[j];
+    }
+    for (int j = 0; j < K - 1; j++) state[(int64_t) c * (K - 1) + j] = st[j];
 }
-GS_EXPORT int gs_conv_step(const float *x, float *state, const float *w, float *y, int n, int K, void *s) {
-    k_conv_step<<<(n + 255) / 256, 256, 0, (cudaStream_t) s>>>(x, state, w, y, n, K);
+GS_EXPORT int gs_conv_scan(const float *x, float *state, const float *w, float *y, int T, int n, int K, int save_at,
+                           float *save, void *s) {
+    if (K < 2 || K > 8) return (int) cudaErrorInvalidValue;
+    k_conv_scan<<<(n + 255) / 256, 256, 0, (cudaStream_t) s>>>(x, state, w, y, T, n, K, save_at, save);
     return (int) cudaGetLastError();
 }
 
 // Forget gate (Glm5NextTextForgetGate). ssm_a holds -exp(A_log) (llama.cpp convention).
-// lower bound lb > -inf: g = lb * sigmoid(exp(A_log) * (f + dt_b));  else g = -exp(A_log) * softplus(f + dt_b)
-__global__ void k_kda_gate(const float *f, const float *dt_b, const float *ssm_a, float *g, int n, int head_dim, float lb) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+// f, g: [T][H][head_dim]. lower bound lb > -inf: g = lb * sigmoid(exp(A_log) * (f + dt_b));
+// else g = -exp(A_log) * softplus(f + dt_b)
+__global__ void k_kda_gate(const float *f, const float *dt_b, const float *ssm_a, float *g, int64_t n, int head_dim, int H,
+                           float lb) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float a = ssm_a[i / head_dim];
-    const float x = f[i] + dt_b[i];
+    const int c = (int) (i % ((int64_t) head_dim * H));
+    const float a = ssm_a[c / head_dim];
+    const float x = f[i] + dt_b[c];
     if (isinf(lb)) {
         const float sp = x > 20.f ? x : log1pf(expf(x));
         g[i] = a * sp;
@@ -279,140 +292,387 @@ __global__ void k_kda_gate(const float *f, const float *dt_b, const float *ssm_a
         g[i] = lb * sigmoidf(-a * x);
     }
 }
-GS_EXPORT int gs_kda_gate(const float *f, const float *dt_b, const float *ssm_a, float *g, int n, int head_dim, float lb, void *s) {
-    k_kda_gate<<<(n + 255) / 256, 256, 0, (cudaStream_t) s>>>(f, dt_b, ssm_a, g, n, head_dim, lb);
+GS_EXPORT int gs_kda_gate(const float *f, const float *dt_b, const float *ssm_a, float *g, int64_t n, int head_dim, int H,
+                          float lb, void *s) {
+    k_kda_gate<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) s>>>(f, dt_b, ssm_a, g, n, head_dim, H, lb);
     return (int) cudaGetLastError();
 }
 
-// One recurrent step (recurrent_kimi_delta_attention) for every head.
-// S: [H][Dk][Dv] fp32 state, q (l2normed and pre-scaled by 1/sqrt(Dk)), k (l2normed), v: [H][D];
-// g: [H][Dk] log-decay; beta_logit: [H] (sigmoid applied here). One block per head, thread = v column.
-__global__ void k_kda_step(float *S, const float *q, const float *k, const float *v, const float *g,
-                           const float *beta_logit, float *out, int D) {
+// Recurrent delta-rule scan (recurrent_kimi_delta_attention) over T tokens. One block per head,
+// thread j owns column j of the head's [D][D] state in registers for the whole scan.
+// S: [H][D][D]; q (l2normed, pre-scaled by 1/sqrt(D)), k (l2normed), v, g (log-decay): [T][H][D];
+// beta_logit: [T][H]; out: [T][H][D]. save_at/S_save: state snapshot after token save_at.
+template <int D>
+__global__ void __launch_bounds__(D) k_kda_scan(float *S, const float *q, const float *k, const float *v, const float *g,
+                                                const float *beta_logit, float *out, int T, int H, int save_at,
+                                                float *S_save) {
     const int h = blockIdx.x, j = threadIdx.x;
-    extern __shared__ float sm[];
-    float *sq = sm, *sk = sm + D, *seg = sm + 2 * D;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        sq[i] = q[h * D + i];
-        sk[i] = k[h * D + i];
-        seg[i] = expf(g[h * D + i]);
-    }
-    __syncthreads();
-    if (j >= D) return;
+    __shared__ float sq[D], sk[D], sg[D];
+    float s[D];
     float *Sh = S + (int64_t) h * D * D;
-    const float beta = sigmoidf(beta_logit[h]);
-    float kv = 0.f;
-    for (int i = 0; i < D; i++) {
-        const float s = Sh[i * D + j] * seg[i];
-        Sh[i * D + j] = s;
-        kv += s * sk[i];
+#pragma unroll
+    for (int i = 0; i < D; i++) s[i] = Sh[i * D + j];
+    for (int t = 0; t < T; t++) {
+        const int64_t base = ((int64_t) t * H + h) * D;
+        __syncthreads();
+        sq[j] = q[base + j];
+        sk[j] = k[base + j];
+        sg[j] = expf(g[base + j]);
+        __syncthreads();
+        const float beta = sigmoidf(beta_logit[(int64_t) t * H + h]);
+        float kv = 0.f;
+#pragma unroll
+        for (int i = 0; i < D; i++) {
+            s[i] *= sg[i];
+            kv += s[i] * sk[i];
+        }
+        const float delta = (v[base + j] - kv) * beta;
+        float o = 0.f;
+#pragma unroll
+        for (int i = 0; i < D; i++) {
+            s[i] += sk[i] * delta;
+            o += s[i] * sq[i];
+        }
+        out[base + j] = o;
+        if (t == save_at) {
+            float *Ss = S_save + (int64_t) h * D * D;
+#pragma unroll
+            for (int i = 0; i < D; i++) Ss[i * D + j] = s[i];
+        }
     }
-    const float delta = (v[h * D + j] - kv) * beta;
-    float o = 0.f;
-    for (int i = 0; i < D; i++) {
-        const float s = Sh[i * D + j] + sk[i] * delta;
-        Sh[i * D + j] = s;
-        o += s * sq[i];
-    }
-    out[h * D + j] = o;
+#pragma unroll
+    for (int i = 0; i < D; i++) Sh[i * D + j] = s[i];
 }
-GS_EXPORT int gs_kda_step(float *S, const float *q, const float *k, const float *v, const float *g, const float *beta_logit,
-                          float *out, int H, int D, void *s) {
-    k_kda_step<<<H, D, 3 * D * sizeof(float), (cudaStream_t) s>>>(S, q, k, v, g, beta_logit, out, D);
+GS_EXPORT int gs_kda_scan(float *S, const float *q, const float *k, const float *v, const float *g, const float *beta_logit,
+                          float *out, int T, int H, int D, int save_at, float *S_save, void *s) {
+    if (D != 128) return (int) cudaErrorInvalidValue;
+    k_kda_scan<128><<<H, 128, 0, (cudaStream_t) s>>>(S, q, k, v, g, beta_logit, out, T, H, save_at, S_save);
     return (int) cudaGetLastError();
 }
 
-// ---- MLA attention (decode, absorbed) ---------------------------------------------------------------
-// For each head h: score_s = scale * q[h] . C[pos_s], softmax over s, o[h] = sum_s p_s * C[pos_s].
-// C: latent cache [n_ctx][R]. idx: selected positions (n_sel) or null for 0..n_sel-1.
-// scratch: [H][n_sel] floats. One block per head, a warp per key for the dot products.
-__global__ void k_mla_attn(const float *q, const float *C, const int *idx, int n_sel, float scale, float *scratch,
-                           float *o, int R) {
-    const int h = blockIdx.x;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    extern __shared__ float sq[];
-    for (int i = threadIdx.x; i < R; i += blockDim.x) sq[i] = q[(int64_t) h * R + i];
-    __syncthreads();
-    float *sc = scratch + (int64_t) h * n_sel;
-    for (int s = warp; s < n_sel; s += nw) {
-        const float *c = C + (int64_t) (idx ? idx[s] : s) * R;
-        float d = 0.f;
-        for (int i = lane; i < R; i += 32) d += sq[i] * c[i];
-        d = warp_sum(d);
-        if (lane == 0) sc[s] = d * scale;
+// ---- MLA attention (absorbed, flash-style, f16 latent cache) -----------------------------------------
+// For query t and head h: score_s = scale * q[t][h] . C[sel[t][s]], softmax over s < cnt[t],
+// o[t][h] = sum_s p_s * C[sel[t][s]]. All 16 heads of a block share each key tile, keys are streamed
+// in tiles of 32 with an online softmax. With splits > 1 the key range is split across blocks and
+// partial results go to `part` (combined by k_mla_combine), which keeps decode (T=1) parallel.
+constexpr int MLA_HG = 16, MLA_KT = 32;
+
+template <int R>
+__global__ void __launch_bounds__(256) k_mla_flash(const float *q, const half *C, const int *sel, int sel_stride,
+                                                   const int *cnt, float scale, float *o, float *part, int H, int splits) {
+    constexpr int RC = R / 256;
+    const int split = blockIdx.x, hg = blockIdx.y, t = blockIdx.z;
+    const int h0 = hg * MLA_HG;
+    extern __shared__ __align__(16) float smf[];
+    float *sq = smf;                                // [HG][R]
+    half *sc = (half *) (sq + MLA_HG * R);          // [KT][R]
+    float *sp = (float *) (sc + MLA_KT * R);        // [HG][KT]
+    float *sm_m = sp + MLA_HG * MLA_KT, *sm_l = sm_m + MLA_HG, *sm_f = sm_l + MLA_HG;
+    int *sidx = (int *) (sm_f + MLA_HG);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int i = tid; i < MLA_HG * R; i += 256) sq[i] = q[((int64_t) t * H + h0) * R + i];
+    if (tid < MLA_HG) {
+        sm_m[tid] = -INFINITY;
+        sm_l[tid] = 0.f;
     }
+    const int n = cnt[t];
+    const int per = (n + splits - 1) / splits;
+    const int s0 = split * per, s1 = min(n, s0 + per);
+    float acc[MLA_HG][RC];
+#pragma unroll
+    for (int h = 0; h < MLA_HG; h++)
+#pragma unroll
+        for (int c = 0; c < RC; c++) acc[h][c] = 0.f;
+    const int *srow = sel + (int64_t) t * sel_stride;
     __syncthreads();
-    float mx = -INFINITY;
-    for (int s = threadIdx.x; s < n_sel; s += blockDim.x) mx = fmaxf(mx, sc[s]);
-    mx = block_max(mx);
-    float sum = 0.f;
-    for (int s = threadIdx.x; s < n_sel; s += blockDim.x) {
-        const float e = expf(sc[s] - mx);
-        sc[s] = e;
-        sum += e;
+    for (int kb = s0; kb < s1; kb += MLA_KT) {
+        const int nk = min(MLA_KT, s1 - kb);
+        if (tid < MLA_KT) sidx[tid] = tid < nk ? srow[kb + tid] : 0;
+        __syncthreads();
+        for (int i = tid; i < MLA_KT * R / 8; i += 256) {
+            const int kk = i / (R / 8), c = i % (R / 8);
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (kk < nk) val = ((const uint4 *) (C + (int64_t) sidx[kk] * R))[c];
+            ((uint4 *) (sc + kk * R))[c] = val;
+        }
+        __syncthreads();
+        for (int kk = warp * 4; kk < warp * 4 + 4; kk++) {
+            float d[MLA_HG];
+#pragma unroll
+            for (int h = 0; h < MLA_HG; h++) d[h] = 0.f;
+            for (int r = lane; r < R; r += 32) {
+                const float cv = __half2float(sc[kk * R + r]);
+#pragma unroll
+                for (int h = 0; h < MLA_HG; h++) d[h] += sq[h * R + r] * cv;
+            }
+#pragma unroll
+            for (int h = 0; h < MLA_HG; h++) d[h] = warp_sum(d[h]);
+            if (lane == 0)
+#pragma unroll
+                for (int h = 0; h < MLA_HG; h++) sp[h * MLA_KT + kk] = kk < nk ? d[h] * scale : -INFINITY;
+        }
+        __syncthreads();
+        if (tid < MLA_HG) {
+            const float m_old = sm_m[tid];
+            float mx = m_old;
+            for (int kk = 0; kk < nk; kk++) mx = fmaxf(mx, sp[tid * MLA_KT + kk]);
+            const float f = m_old == -INFINITY ? 0.f : expf(m_old - mx);
+            float l = sm_l[tid] * f;
+            for (int kk = 0; kk < MLA_KT; kk++) {
+                const float p = kk < nk ? expf(sp[tid * MLA_KT + kk] - mx) : 0.f;
+                sp[tid * MLA_KT + kk] = p;
+                l += p;
+            }
+            sm_m[tid] = mx;
+            sm_l[tid] = l;
+            sm_f[tid] = f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < MLA_HG; h++) {
+            const float f = sm_f[h];
+#pragma unroll
+            for (int c = 0; c < RC; c++) {
+                float a = acc[h][c] * f;
+                for (int kk = 0; kk < nk; kk++) a += sp[h * MLA_KT + kk] * __half2float(sc[kk * R + tid + 256 * c]);
+                acc[h][c] = a;
+            }
+        }
+        __syncthreads();
     }
-    sum = block_sum(sum);
-    const float inv = 1.f / sum;
-    __syncthreads();
-    for (int i = threadIdx.x; i < R; i += blockDim.x) {
-        float acc = 0.f;
-        for (int s = 0; s < n_sel; s++) acc += sc[s] * C[(int64_t) (idx ? idx[s] : s) * R + i];
-        o[(int64_t) h * R + i] = acc * inv;
+    if (splits == 1) {
+#pragma unroll
+        for (int h = 0; h < MLA_HG; h++) {
+            const float l = sm_l[h];
+            const float inv = l > 0.f ? 1.f / l : 0.f;
+#pragma unroll
+            for (int c = 0; c < RC; c++) o[((int64_t) t * H + h0 + h) * R + tid + 256 * c] = acc[h][c] * inv;
+        }
+    } else {
+        float *pp = part + (((int64_t) t * (H / MLA_HG) + hg) * splits + split) * (MLA_HG * R + 2 * MLA_HG);
+#pragma unroll
+        for (int h = 0; h < MLA_HG; h++)
+#pragma unroll
+            for (int c = 0; c < RC; c++) pp[h * R + tid + 256 * c] = acc[h][c];
+        if (tid < MLA_HG) {
+            pp[MLA_HG * R + tid] = sm_m[tid];
+            pp[MLA_HG * R + MLA_HG + tid] = sm_l[tid];
+        }
     }
 }
-GS_EXPORT int gs_mla_attn(const float *q, const float *C, const int *idx, int n_sel, float scale, float *scratch, float *o,
-                          int H, int R, void *s) {
-    k_mla_attn<<<H, 256, R * sizeof(float), (cudaStream_t) s>>>(q, C, idx, n_sel, scale, scratch, o, R);
+
+template <int R>
+__global__ void k_mla_combine(const float *part, float *o, int H, int splits) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    const int hg = h / MLA_HG, hh = h % MLA_HG;
+    const int64_t stride = MLA_HG * R + 2 * MLA_HG;
+    const float *base = part + ((int64_t) t * (H / MLA_HG) + hg) * splits * stride;
+    float M = -INFINITY;
+    for (int s = 0; s < splits; s++) M = fmaxf(M, base[s * stride + MLA_HG * R + hh]);
+    float L = 0.f;
+    for (int s = 0; s < splits; s++) {
+        const float m = base[s * stride + MLA_HG * R + hh];
+        if (m != -INFINITY) L += base[s * stride + MLA_HG * R + MLA_HG + hh] * expf(m - M);
+    }
+    const float inv = L > 0.f ? 1.f / L : 0.f;
+    for (int r = threadIdx.x; r < R; r += blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < splits; s++) {
+            const float m = base[s * stride + MLA_HG * R + hh];
+            if (m != -INFINITY) a += base[s * stride + hh * R + r] * expf(m - M);
+        }
+        o[((int64_t) t * H + h) * R + r] = a * inv;
+    }
+}
+
+static size_t mla_smem(int R) { return (size_t) MLA_HG * R * 4 + MLA_KT * R * 2 + MLA_HG * MLA_KT * 4 + 3 * MLA_HG * 4 + MLA_KT * 4; }
+
+// part must hold T * (H/16) * splits * (16*R + 32) floats when splits > 1.
+GS_EXPORT int gs_mla_attn(const float *q, const void *C, const int *sel, int sel_stride, const int *cnt, float scale,
+                          float *o, float *part, int T, int H, int R, int splits, void *s) {
+    if (R != 512 || H % MLA_HG != 0 || splits < 1) return (int) cudaErrorInvalidValue;
+    const size_t sm = mla_smem(R);
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(k_mla_flash<512>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+        attr = true;
+    }
+    dim3 grid(splits, H / MLA_HG, T);
+    k_mla_flash<512><<<grid, 256, sm, (cudaStream_t) s>>>(q, (const half *) C, sel, sel_stride, cnt, scale, o, part, H, splits);
+    if (splits > 1) k_mla_combine<512><<<dim3(H, T), 256, 0, (cudaStream_t) s>>>(part, o, H, splits);
     return (int) cudaGetLastError();
 }
 
 // ---- DSA k-pool indexer (Glm5NextTextIndexer) --------------------------------------------------------
-// Pooled key of one complete pool: P[c] = sum_m softmax_m(gate[m][c] + ape[m][c]) * key[m][c]
-// rows: kpool consecutive cache rows of [key(Dk) | gate(Dk)]
-__global__ void k_idx_pool(const float *rows, const float *ape, float *P, int Dk, int kpool) {
+// Raw key/gate rows are only needed until their pool of `kpool` positions is complete, so they live
+// in the current chunk ([T][Dk], positions p0..p0+T-1) or in a ring of kpool rows (older positions).
+static __device__ __forceinline__ const float *idx_row(const float *chunk, const float *ring, int64_t pos, int p0, int Dk,
+                                                       int kpool) {
+    return pos >= p0 ? chunk + (pos - p0) * Dk : ring + (pos % kpool) * Dk;
+}
+
+// Pooled key of every pool j in [j0, j0+n_pools): P[j][c] = sum_m softmax_m(gate + ape)[m][c] * key[m][c]
+__global__ void k_idx_pool(const float *kc, const float *gc, const float *rk, const float *rg, const float *ape, float *P,
+                           int p0, int j0, int Dk, int kpool) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t j = j0 + blockIdx.y;
     if (c >= Dk) return;
     float mx = -INFINITY;
-    for (int m = 0; m < kpool; m++) mx = fmaxf(mx, rows[m * 2 * Dk + Dk + c] + ape[m * Dk + c]);
+    for (int m = 0; m < kpool; m++) {
+        const int64_t pos = j * kpool + m;
+        mx = fmaxf(mx, idx_row(gc, rg, pos, p0, Dk, kpool)[c] + ape[m * Dk + c]);
+    }
     float sum = 0.f, acc = 0.f;
     for (int m = 0; m < kpool; m++) {
-        const float e = expf(rows[m * 2 * Dk + Dk + c] + ape[m * Dk + c] - mx);
+        const int64_t pos = j * kpool + m;
+        const float e = expf(idx_row(gc, rg, pos, p0, Dk, kpool)[c] + ape[m * Dk + c] - mx);
         sum += e;
-        acc += e * rows[m * 2 * Dk + c];
+        acc += e * idx_row(kc, rk, pos, p0, Dk, kpool)[c];
     }
-    P[c] = acc / sum;
+    P[j * Dk + c] = acc / sum;
 }
-GS_EXPORT int gs_idx_pool(const float *rows, const float *ape, float *P, int Dk, int kpool, void *s) {
-    k_idx_pool<<<(Dk + 127) / 128, 128, 0, (cudaStream_t) s>>>(rows, ape, P, Dk, kpool);
+// After a chunk: copy rows of the trailing incomplete pool into the ring.
+__global__ void k_idx_ring_store(const float *kc, const float *gc, float *rk, float *rg, int p0, int first, int last,
+                                 int Dk, int kpool) {
+    const int64_t pos = first + blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= last || c >= Dk) return;
+    rk[(pos % kpool) * Dk + c] = kc[(pos - p0) * Dk + c];
+    rg[(pos % kpool) * Dk + c] = gc[(pos - p0) * Dk + c];
+}
+GS_EXPORT int gs_idx_pool(const float *kc, const float *gc, float *rk, float *rg, const float *ape, float *P, int p0, int T,
+                          int Dk, int kpool, void *s) {
+    const int end = p0 + T;
+    // pools completing inside [p0, end): jf (the pool holding p0) .. jl-1
+    const int jf = p0 / kpool, jl = end / kpool;
+    if (jl > jf) {
+        dim3 grid((Dk + 127) / 128, jl - jf);
+        k_idx_pool<<<grid, 128, 0, (cudaStream_t) s>>>(kc, gc, rk, rg, ape, P, p0, jf, Dk, kpool);
+    }
+    const int first = max(p0, jl * kpool);
+    if (end > first) {
+        dim3 grid((Dk + 127) / 128, end - first);
+        k_idx_ring_store<<<grid, 128, 0, (cudaStream_t) s>>>(kc, gc, rk, rg, p0, first, end, Dk, kpool);
+    }
     return (int) cudaGetLastError();
 }
 
-// score[p] = sum_h w[h] * relu(scale * q[h] . P[p])   for p < n_pool   (warp per pool)
-__global__ void k_idx_score(const float *q, const float *w, const float *P, int n_pool, float *score, int Hq, int Dk, float scale) {
-    extern __shared__ float sq[];
-    for (int i = threadIdx.x; i < Hq * Dk; i += blockDim.x) sq[i] = q[i];
-    __syncthreads();
-    const int lane = threadIdx.x & 31;
+// score[t][p] = sum_h w[t][h] * relu(scale * q[t][h] . P[p])   for p < n_pool(t) = (pos0 + t + 1) / kpool
+// One block per (group of 8 pools, query); a warp per pool.
+__global__ void k_idx_score(const float *q, const float *w, const float *P, float *score, int64_t score_stride, int pos0,
+                            int kpool, int Hq, int Dk, float scale) {
+    const int t = blockIdx.y;
+    const int n_pool = (pos0 + t + 1) / kpool;
     const int p = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if ((int) (blockIdx.x * (blockDim.x >> 5)) >= n_pool) return;
+    extern __shared__ float sq[];
+    const float *qt = q + (int64_t) t * Hq * Dk;
+    for (int i = threadIdx.x; i < Hq * Dk; i += blockDim.x) sq[i] = qt[i];
+    __syncthreads();
     if (p >= n_pool) return;
+    const int lane = threadIdx.x & 31;
     const float *pk = P + (int64_t) p * Dk;
     float kreg[4];
 #pragma unroll
     for (int r = 0; r < 4; r++) kreg[r] = (lane + 32 * r) < Dk ? pk[lane + 32 * r] : 0.f;
+    const float *wt = w + (int64_t) t * Hq;
     float total = 0.f;
     for (int h = 0; h < Hq; h++) {
         float d = 0.f;
 #pragma unroll
         for (int r = 0; r < 4; r++) d += (lane + 32 * r) < Dk ? sq[h * Dk + lane + 32 * r] * kreg[r] : 0.f;
         d = warp_sum(d);
-        total += w[h] * fmaxf(d * scale, 0.f);
+        total += wt[h] * fmaxf(d * scale, 0.f);
     }
-    if (lane == 0) score[p] = total;
+    if (lane == 0) score[(int64_t) t * score_stride + p] = total;
 }
-GS_EXPORT int gs_idx_score(const float *q, const float *w, const float *P, int n_pool, float *score, int Hq, int Dk, float scale, void *s) {
-    if (n_pool <= 0) return 0;
+GS_EXPORT int gs_idx_score(const float *q, const float *w, const float *P, float *score, int64_t score_stride, int pos0, int T,
+                           int kpool, int Hq, int Dk, float scale, void *s) {
+    const int max_pool = (pos0 + T) / kpool;
+    if (max_pool <= 0 || T <= 0) return 0;
     if (Dk > 128) return (int) cudaErrorInvalidValue;
     const int warps = 8;
-    k_idx_score<<<(n_pool + warps - 1) / warps, warps * 32, Hq * Dk * sizeof(float), (cudaStream_t) s>>>(q, w, P, n_pool, score, Hq, Dk, scale);
+    dim3 grid((max_pool + warps - 1) / warps, T);
+    k_idx_score<<<grid, warps * 32, Hq * Dk * sizeof(float), (cudaStream_t) s>>>(q, w, P, score, score_stride, pos0, kpool,
+                                                                              Hq, Dk, scale);
+    return (int) cudaGetLastError();
+}
+
+// Build the attended position list of each query t (position pos0 + t):
+//   n_pool <= top_k: every position 0..pos (dense);
+//   else: the 4 positions of each of the top_k highest-scoring pools + the incomplete tail.
+// Top-k is an exact radix select on the order-preserving uint32 image of the scores.
+static __device__ __forceinline__ uint32_t f2ord(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__global__ void k_idx_select(const float *score, int64_t score_stride, int pos0, int kpool, int top_k, int *sel,
+                             int sel_stride, int *cnt) {
+    const int t = blockIdx.x;
+    const int pos = pos0 + t;
+    const int n_pool = (pos + 1) / kpool;
+    int *out = sel + (int64_t) t * sel_stride;
+    if (n_pool <= top_k) {
+        for (int i = threadIdx.x; i <= pos; i += blockDim.x) out[i] = i;
+        if (threadIdx.x == 0) cnt[t] = pos + 1;
+        return;
+    }
+    const float *sc = score + (int64_t) t * score_stride;
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t s_prefix, s_mask, s_need, s_count;
+    if (threadIdx.x == 0) {
+        s_prefix = 0;
+        s_mask = 0;
+        s_need = top_k;
+    }
+    __syncthreads();
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        const uint32_t prefix = s_prefix, mask = s_mask;
+        for (int p = threadIdx.x; p < n_pool; p += blockDim.x) {
+            const uint32_t u = f2ord(sc[p]);
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t need = s_need, acc = 0;
+            int d = 255;
+            for (; d > 0; d--) {
+                if (acc + hist[d] >= need) break;
+                acc += hist[d];
+            }
+            s_need = need - acc;  // how many to take among those equal to the prefix so far
+            s_prefix = prefix | ((uint32_t) d << shift);
+            s_mask = mask | (255u << shift);
+        }
+        __syncthreads();
+    }
+    // threshold value U = s_prefix; take all > U, and s_need of those == U
+    const uint32_t U = s_prefix;
+    if (threadIdx.x == 0) s_count = 0;
+    __shared__ uint32_t s_eq;
+    if (threadIdx.x == 0) s_eq = 0;
+    __syncthreads();
+    const uint32_t need_eq = s_need;
+    for (int p = threadIdx.x; p < n_pool; p += blockDim.x) {
+        const uint32_t u = f2ord(sc[p]);
+        bool take = u > U;
+        if (u == U) take = atomicAdd(&s_eq, 1u) < need_eq;
+        if (take) {
+            const uint32_t slot = atomicAdd(&s_count, 1u);
+            for (int m = 0; m < kpool; m++) out[slot * kpool + m] = p * kpool + m;
+        }
+    }
+    __syncthreads();
+    const int base = top_k * kpool;
+    const int tail0 = n_pool * kpool;
+    for (int i = threadIdx.x; tail0 + i <= pos; i += blockDim.x) out[base + i] = tail0 + i;
+    if (threadIdx.x == 0) cnt[t] = base + (pos + 1 - tail0);
+}
+GS_EXPORT int gs_idx_select(const float *score, int64_t score_stride, int pos0, int T, int kpool, int top_k, int *sel,
+                            int sel_stride, int *cnt, void *s) {
+    if (T <= 0) return 0;
+    k_idx_select<<<T, 256, 0, (cudaStream_t) s>>>(score, score_stride, pos0, kpool, top_k, sel, sel_stride, cnt);
     return (int) cudaGetLastError();
 }
