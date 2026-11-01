@@ -209,3 +209,39 @@ pub fn bench() -> Result<()> {
     }
     Ok(())
 }
+
+/// Compare the CPU reference against vectors decoded by gguf-py (tools/qref.py).
+pub fn check_ref_dir(dir: &Path) -> Result<()> {
+    let mut n = 0;
+    let mut all_ok = true;
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    entries.sort();
+    for bin in entries.iter().filter(|p| p.extension().is_some_and(|e| e == "bin")) {
+        let stem = bin.file_stem().unwrap().to_string_lossy().to_string();
+        let ty_name = stem.split_once('_').map(|x| x.1).unwrap_or("");
+        let Some(ty) = TYPES.iter().copied().find(|t| format!("{t:?}") == ty_name) else { continue };
+        let raw = std::fs::read(bin)?;
+        let want: Vec<f32> = std::fs::read(bin.with_extension("f32"))?
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let mut got = vec![0f32; want.len()];
+        quants::dequantize(ty, &raw, &mut got)?;
+        let (e, i) = max_rel_err(&got, &want);
+        let ok = e < 1e-5;
+        all_ok &= ok;
+        n += 1;
+        println!("  {:<16} {:>8} values  max rel err {:.1e}  {}", stem, want.len(), e, if ok { "OK" } else { "FAIL" });
+        if !ok {
+            println!("      at {i}: ours {} vs gguf-py {}", got[i], want[i]);
+        }
+    }
+    if n == 0 {
+        bail!("no reference vectors in {}", dir.display());
+    }
+    if !all_ok {
+        bail!("CPU reference disagrees with gguf-py");
+    }
+    println!("CPU reference matches gguf-py on {n} vector sets");
+    Ok(())
+}

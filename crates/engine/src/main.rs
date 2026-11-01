@@ -53,6 +53,9 @@ enum Cmd {
         /// Also test real tensors from this (fully downloaded) model
         #[arg(short, long)]
         model: Option<PathBuf>,
+        /// Compare the CPU reference with gguf-py vectors in this dir (tools/qref.py)
+        #[arg(long)]
+        ref_dir: Option<PathBuf>,
     },
     /// Benchmark the quantized GEMV kernels
     Qbench,
@@ -81,7 +84,10 @@ fn main() -> Result<()> {
             cuda::smoke_test()?;
             println!("CUDA smoke test OK");
         }
-        Cmd::Qtest { model } => qtest::run(model.as_deref())?,
+        Cmd::Qtest { model, ref_dir } => match ref_dir {
+            Some(d) => qtest::check_ref_dir(&d)?,
+            None => qtest::run(model.as_deref())?,
+        },
         Cmd::Qbench => qtest::bench()?,
         Cmd::Inspect { model, budget, tensors } => {
             let g = if model.headers_only {
