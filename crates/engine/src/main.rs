@@ -17,7 +17,11 @@ use serde_json::{json, Value as Json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-const DEFAULT_MODEL: &str = "models/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf";
+/// Absolute paths into this repository, so the installed binary works from any folder
+/// (override with -m / GLMSSD_MODEL and --profile).
+const DEFAULT_MODEL: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf");
+const DEFAULT_PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/hot-experts.txt");
 
 #[derive(Parser)]
 #[command(name = "glm-ssd", version, about = "SSD-streaming inference engine for GLM-5.3-Flash")]
@@ -29,7 +33,7 @@ struct Cli {
 #[derive(clap::Args, Clone)]
 struct ModelArgs {
     /// Any shard of the GGUF model
-    #[arg(short, long, default_value = DEFAULT_MODEL)]
+    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
     model: PathBuf,
     /// Parse headers only (works on truncated shards, for inspection before download completes)
     #[arg(long)]
@@ -59,7 +63,7 @@ struct BudgetArgs {
 #[derive(clap::Args, Clone)]
 struct EngineArgs {
     /// Any shard of the GGUF model
-    #[arg(short, long, default_value = DEFAULT_MODEL)]
+    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
     model: PathBuf,
     /// Total VRAM the engine may use: weights + caches + scratch; the rest becomes the expert cache (e.g. 22G)
     #[arg(long)]
@@ -80,7 +84,7 @@ struct EngineArgs {
     #[arg(long, default_value_t = 8)]
     io_threads: usize,
     /// Learned hot-expert profile (read at start for cache priorities, updated on exit)
-    #[arg(long, default_value = "hot-experts.txt")]
+    #[arg(long, default_value = DEFAULT_PROFILE)]
     profile: PathBuf,
     /// Don't read or write the hot-expert profile
     #[arg(long)]
@@ -236,14 +240,14 @@ enum Cmd {
     },
     /// Tokenize text with the model's tokenizer (only needs the first shard)
     Tokenize {
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
         model: PathBuf,
         /// Text to encode; special tokens like <|user|> are parsed
         text: String,
     },
     /// Render a chat with the model's template (messages as JSON) and tokenize it
     Template {
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
         model: PathBuf,
         /// JSON array of messages
         messages: String,

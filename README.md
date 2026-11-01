@@ -16,6 +16,14 @@ for others), MSVC on Windows.
 cargo build --release
 ```
 
+Install the `glm-ssd` command (into `~/.cargo/bin`, which is on PATH). Rerun it after pulling
+changes. The binary finds the model in this repo's `models/` folder from any directory
+(override with `-m` or `GLMSSD_MODEL`):
+
+```
+cargo install --path crates/engine
+```
+
 Download the model (resumable, SHA-256 verified):
 
 ```
