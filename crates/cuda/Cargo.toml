@@ -1,0 +1,12 @@
+[package]
+name = "cuda"
+version = "0.1.0"
+edition = "2021"
+description = "CUDA kernels (nvcc via build.rs) + thin safe Rust wrappers"
+links = "glmssd_kernels"
+
+[dependencies]
+anyhow = "1"
+
+[build-dependencies]
+cc = "1"

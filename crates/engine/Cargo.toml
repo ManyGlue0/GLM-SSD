@@ -1,0 +1,15 @@
+[package]
+name = "glm-ssd"
+version = "0.1.0"
+edition = "2021"
+description = "SSD-streaming MoE inference engine for GLM-5.3-Flash"
+
+[[bin]]
+name = "glm-ssd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+gguf = { path = "../gguf" }
+cuda = { path = "../cuda" }

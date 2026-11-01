@@ -1,0 +1,6 @@
+/target
+/models
+/ref
+*.part
+*.part.json
+download.log

@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["tools/hfdl", "crates/gguf", "crates/cuda", "crates/engine"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
