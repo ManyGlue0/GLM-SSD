@@ -45,6 +45,7 @@ pub mod ffi {
         pub fn gs_event_query(e: *mut c_void) -> i32;
         pub fn gs_stream_wait_event(s: *mut c_void, e: *mut c_void) -> i32;
         pub fn gs_event_elapsed_ms(ms: *mut f32, a: *mut c_void, b: *mut c_void) -> i32;
+        pub fn gs_memset(p: *mut c_void, v: i32, n: usize, s: *mut c_void) -> i32;
         pub fn gs_saxpy(n: i32, a: f32, x: *const f32, y: *mut f32, s: *mut c_void) -> i32;
 
         pub fn gs_dequant_f32(ty: i32, src: *const c_void, n: i64, dst: *mut f32, s: *mut c_void) -> i32;
@@ -53,6 +54,37 @@ pub mod ffi {
             ty: i32, w: *const c_void, row_stride: i64, k: i32, rows: i32, x: *const f32, x_stride: i64,
             y: *mut f32, y_stride: i64, b: i32, accumulate: i32, s: *mut c_void,
         ) -> i32;
+        pub fn gs_gemv_batched(
+            ty: i32, w: *const c_void, row_stride: i64, k: i32, rows: i32, x: *const f32, y: *mut f32, n_batch: i32,
+            w_bs: i64, x_bs: i64, y_bs: i64, s: *mut c_void,
+        ) -> i32;
+
+        // ops.cu
+        pub fn gs_rmsnorm(x: *const f32, w: *const f32, y: *mut f32, rows: i32, n: i32, eps: f32, s: *mut c_void) -> i32;
+        pub fn gs_layernorm(x: *const f32, w: *const f32, b: *const f32, y: *mut f32, rows: i32, n: i32, eps: f32, s: *mut c_void) -> i32;
+        pub fn gs_l2norm(x: *const f32, y: *mut f32, rows: i32, n: i32, eps: f32, scale: f32, s: *mut c_void) -> i32;
+        pub fn gs_rmsnorm_gated(x: *const f32, w: *const f32, gate: *const f32, y: *mut f32, rows: i32, n: i32, eps: f32, s: *mut c_void) -> i32;
+        pub fn gs_swiglu(g: *const f32, u: *const f32, y: *mut f32, n: i64, lim: f32, s: *mut c_void) -> i32;
+        pub fn gs_axpy(y: *mut f32, x: *const f32, a: f32, n: i64, s: *mut c_void) -> i32;
+        pub fn gs_hc_pre(
+            streams: *const f32, mixes: *const f32, scale: *const f32, base: *const f32, hcw: *mut f32, collapsed: *mut f32,
+            t: i32, d: i32, eps: f32, iters: i32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_hc_post(streams: *mut f32, out: *const f32, hcw: *const f32, t: i32, d: i32, s: *mut c_void) -> i32;
+        pub fn gs_hc_mean(streams: *const f32, y: *mut f32, t: i32, d: i32, s: *mut c_void) -> i32;
+        pub fn gs_hc_expand(x: *const f32, streams: *mut f32, t: i32, d: i32, s: *mut c_void) -> i32;
+        pub fn gs_conv_step(x: *const f32, state: *mut f32, w: *const f32, y: *mut f32, n: i32, k: i32, s: *mut c_void) -> i32;
+        pub fn gs_kda_gate(f: *const f32, dt_b: *const f32, ssm_a: *const f32, g: *mut f32, n: i32, head_dim: i32, lb: f32, s: *mut c_void) -> i32;
+        pub fn gs_kda_step(
+            state: *mut f32, q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta_logit: *const f32, out: *mut f32,
+            h: i32, d: i32, s: *mut c_void,
+        ) -> i32;
+        pub fn gs_mla_attn(
+            q: *const f32, c: *const f32, idx: *const i32, n_sel: i32, scale: f32, scratch: *mut f32, o: *mut f32, h: i32, r: i32,
+            s: *mut c_void,
+        ) -> i32;
+        pub fn gs_idx_pool(rows: *const f32, ape: *const f32, p: *mut f32, dk: i32, kpool: i32, s: *mut c_void) -> i32;
+        pub fn gs_idx_score(q: *const f32, w: *const f32, p: *const f32, n_pool: i32, score: *mut f32, hq: i32, dk: i32, scale: f32, s: *mut c_void) -> i32;
     }
 }
 
@@ -195,6 +227,12 @@ impl DeviceBuffer {
     pub fn upload(&self, off: usize, src: &[u8], s: &Stream) -> Result<()> {
         assert!(off + src.len() <= self.len);
         check(unsafe { ffi::gs_memcpy_h2d((self.ptr as *mut u8).add(off) as _, src.as_ptr() as _, src.len(), s.0) })
+    }
+    pub fn zero(&self, s: &Stream) -> Result<()> {
+        check(unsafe { ffi::gs_memset(self.ptr, 0, self.len, s.0) })
+    }
+    pub fn f32(&self) -> *mut f32 {
+        self.ptr as *mut f32
     }
     pub fn download(&self, off: usize, dst: &mut [u8], s: &Stream) -> Result<()> {
         assert!(off + dst.len() <= self.len);

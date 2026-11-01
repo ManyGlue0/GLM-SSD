@@ -84,3 +84,5 @@ GS_EXPORT int gs_saxpy(int n, float a, const float *x, float *y, void *s) {
     k_saxpy<<<(n + 255) / 256, 256, 0, (cudaStream_t) s>>>(n, a, x, y);
     return (int) cudaGetLastError();
 }
+
+GS_EXPORT int gs_memset(void *p, int v, size_t n, void *s) { return (int) cudaMemsetAsync(p, v, n, (cudaStream_t) s); }

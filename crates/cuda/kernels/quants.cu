@@ -47,7 +47,12 @@ constexpr int GEMV_WARPS = 4;
 template <class Q, int B>
 __global__ void __launch_bounds__(GEMV_WARPS * 32)
 k_gemv(const uint8_t *__restrict__ W, int64_t row_stride, int K, int rows,
-       const float *__restrict__ x, int64_t x_stride, float *__restrict__ y, int64_t y_stride, int accumulate) {
+       const float *__restrict__ x, int64_t x_stride, float *__restrict__ y, int64_t y_stride, int accumulate,
+       int64_t w_bs, int64_t x_bs, int64_t y_bs) {
+    // blockIdx.y selects one of several independent matrices (batched GEMV, e.g. per attention head)
+    W += blockIdx.y * w_bs;
+    x += blockIdx.y * x_bs;
+    y += blockIdx.y * y_bs;
     extern __shared__ __align__(16) uint8_t sm[];
     Q::init_smem(sm, threadIdx.x, blockDim.x);
     __syncthreads();
@@ -89,7 +94,8 @@ static int g_sm_count = 0;
 
 template <class Q, int B>
 static void launch_gemv(const void *W, int64_t row_stride, int K, int rows, const float *x, int64_t x_stride,
-                        float *y, int64_t y_stride, int acc, cudaStream_t s) {
+                        float *y, int64_t y_stride, int acc, cudaStream_t s,
+                        int n_batch = 1, int64_t w_bs = 0, int64_t x_bs = 0, int64_t y_bs = 0) {
     if (g_sm_count == 0) {
         int dev = 0;
         cudaGetDevice(&dev);
@@ -99,7 +105,9 @@ static void launch_gemv(const void *W, int64_t row_stride, int K, int rows, cons
     const int need = (rows + GEMV_WARPS - 1) / GEMV_WARPS;
     const int cap = Q::SMEM > 0 ? g_sm_count * 16 : need;
     const unsigned blocks = (unsigned) (need < cap ? need : cap);
-    k_gemv<Q, B><<<blocks, GEMV_WARPS * 32, Q::SMEM, s>>>((const uint8_t *) W, row_stride, K, rows, x, x_stride, y, y_stride, acc);
+    dim3 grid(blocks, n_batch);
+    k_gemv<Q, B><<<grid, GEMV_WARPS * 32, Q::SMEM, s>>>((const uint8_t *) W, row_stride, K, rows, x, x_stride, y, y_stride, acc,
+                                                       w_bs, x_bs, y_bs);
 }
 
 // W: rows x K quantized matrix (row-major, row_stride bytes per row). x: B vectors of K floats
@@ -121,6 +129,19 @@ GS_EXPORT int gs_gemv(int type, const void *W, int64_t row_stride, int K, int ro
             case 7: launch_gemv<Q, 7>(W, row_stride, K, rows, x, x_stride, y, y_stride, accumulate, s); break;
             case 8: launch_gemv<Q, 8>(W, row_stride, K, rows, x, x_stride, y, y_stride, accumulate, s); break;
         }
+    });
+    if (!ok || bad_k) return (int) cudaErrorInvalidValue;
+    return (int) cudaGetLastError();
+}
+
+// n_batch independent single-vector GEMVs: matrix b at W + b*w_bs bytes, x at x + b*x_bs, y at y + b*y_bs (floats).
+GS_EXPORT int gs_gemv_batched(int type, const void *W, int64_t row_stride, int K, int rows, const float *x, float *y,
+                              int n_batch, int64_t w_bs, int64_t x_bs, int64_t y_bs, void *stream) {
+    if (K % 8 != 0 || n_batch < 1) return (int) cudaErrorInvalidValue;
+    bool bad_k = false;
+    bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        if (K % Q::QK != 0) { bad_k = true; return; }
+        launch_gemv<Q, 1>(W, row_stride, K, rows, x, 0, y, 0, 0, (cudaStream_t) stream, n_batch, w_bs, x_bs, y_bs);
     });
     if (!ok || bad_k) return (int) cudaErrorInvalidValue;
     return (int) cudaGetLastError();

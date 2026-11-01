@@ -5,3 +5,4 @@
 *.part.json
 download.log
 /testdata
+/.claude/settings.local.json

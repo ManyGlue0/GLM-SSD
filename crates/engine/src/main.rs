@@ -1,6 +1,9 @@
 mod config;
+mod forward;
+mod model;
 mod plan;
 mod qtest;
+mod tokenizer;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -59,6 +62,33 @@ enum Cmd {
     },
     /// Benchmark the quantized GEMV kernels
     Qbench,
+    /// Run token ids through the model (M2 validation path): greedy generation + optional trace
+    Run {
+        #[command(flatten)]
+        model: ModelArgs,
+        /// Comma-separated prompt token ids
+        #[arg(long)]
+        tokens: String,
+        /// Tokens to generate (greedy)
+        #[arg(short = 'n', long, default_value_t = 16)]
+        n_predict: usize,
+        /// Max context
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        /// Print per-layer tensor stats (compare with llama-eval-callback)
+        #[arg(long)]
+        trace: bool,
+        /// Print the top-k logits for every predicted position
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
+    /// Tokenize text with the model's tokenizer (only needs the first shard)
+    Tokenize {
+        #[arg(short, long, default_value = DEFAULT_MODEL)]
+        model: PathBuf,
+        /// Text to encode; special tokens like <|user|> are parsed
+        text: String,
+    },
     /// Print model structure and the memory placement plan for the given budgets
     Inspect {
         #[command(flatten)]
@@ -89,6 +119,16 @@ fn main() -> Result<()> {
             None => qtest::run(model.as_deref())?,
         },
         Cmd::Qbench => qtest::bench()?,
+        Cmd::Tokenize { model, text } => {
+            let g = gguf::Gguf::open_shard(&model)?;
+            let v = tokenizer::Vocab::from_gguf(&g)?;
+            let ids = v.encode(&text, true);
+            println!("{} tokens: {:?}", ids.len(), ids);
+            let pieces: Vec<String> = ids.iter().map(|&i| format!("{:?}", v.decode(&[i]))).collect();
+            println!("{}", pieces.join(" | "));
+            println!("roundtrip ok: {}", v.decode(&ids) == text);
+        }
+        Cmd::Run { model, tokens, n_predict, ctx, trace, top } => run(&model, &tokens, n_predict, ctx, trace, top)?,
         Cmd::Inspect { model, budget, tensors } => {
             let g = if model.headers_only {
                 gguf::Gguf::open_headers_only(&model.model)?
@@ -119,5 +159,56 @@ fn main() -> Result<()> {
             p.print(&cfg);
         }
     }
+    Ok(())
+}
+
+fn run(m: &ModelArgs, tokens: &str, n_predict: usize, ctx: usize, trace: bool, top: usize) -> Result<()> {
+    let g = gguf::Gguf::open(&m.model)?;
+    let cfg = config::Config::from_gguf(&g)?;
+    let vocab = tokenizer::Vocab::from_gguf(&g)?;
+    let prompt: Vec<u32> = tokens.split(',').map(|t| t.trim().parse()).collect::<Result<_, _>>()?;
+    let mut eng = forward::Engine::new(&g, cfg, ctx)?;
+    eng.trace = trace;
+    println!("prompt ({} tokens): {:?}", prompt.len(), vocab.decode(&prompt));
+
+    let t0 = std::time::Instant::now();
+    let mut logits = None;
+    for (i, &t) in prompt.iter().enumerate() {
+        logits = eng.step(t, i + 1 == prompt.len())?;
+    }
+    let prompt_time = t0.elapsed();
+    let mut out = Vec::new();
+    let t1 = std::time::Instant::now();
+    for _ in 0..n_predict {
+        let l = logits.take().unwrap();
+        let mut idx: Vec<usize> = (0..l.len()).collect();
+        idx.select_nth_unstable_by(top.max(1) - 1, |a, b| l[*b].total_cmp(&l[*a]));
+        let mut best: Vec<usize> = idx[..top.max(1)].to_vec();
+        best.sort_by(|a, b| l[*b].total_cmp(&l[*a]));
+        let next = best[0] as u32;
+        if top > 1 {
+            let alts: Vec<String> = best.iter().map(|&i| format!("{:?}={:.2}", vocab.decode(&[i as u32]), l[i])).collect();
+            println!("  pos {:>4}: {}", eng.pos, alts.join("  "));
+        }
+        out.push(next);
+        if eng.cfg.eos.contains(&next) {
+            break;
+        }
+        logits = eng.step(next, true)?;
+    }
+    let gen_time = t1.elapsed();
+    println!("
+output: {:?}", vocab.decode(&out));
+    println!("tokens: {out:?}");
+    let tm = &eng.timings;
+    println!(
+        "prompt {:.1}s ({:.2} tok/s) | generation {:.2} tok/s | expert reads {:.1}s, {:.1} GB ({:.2} GB/s)",
+        prompt_time.as_secs_f64(),
+        prompt.len() as f64 / prompt_time.as_secs_f64(),
+        out.len() as f64 / gen_time.as_secs_f64(),
+        tm.expert_read.as_secs_f64(),
+        tm.expert_bytes as f64 / 1e9,
+        tm.expert_bytes as f64 / 1e9 / tm.expert_read.as_secs_f64().max(1e-9)
+    );
     Ok(())
 }
