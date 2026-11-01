@@ -102,23 +102,56 @@ much of the remaining SSD traffic can be hidden behind compute.
    (Q4_K Q5_K Q6_K Q8_0 IQ2_XXS IQ2_S IQ3_XXS IQ4_XS Q2_K Q3_K F32/F16). ✅
    `glm-ssd qtest` checks them bit-exact against the CPU port (`crates/quants`) on random and
    real blocks; `glm-ssd qbench` measures GEMV bandwidth (IQ2_XXS ~200-270 GB/s, IQ3_XXS ~400,
-   Q8_0/F16 ~800 of 936 GB/s at batch 1). Batch 4-8 is input-load bound -> int8 x + dp4a in M5.
+   Q8_0/F16 ~800 of 936 GB/s at batch 1). Batch 4-8 is input-load bound.
 3. **M2** correct forward pass (slow path) — mHC, KDA, nope-MLA+indexer, MoE, head. ✅
    Validated 2026-11-01: `glm-ssd run --trace` tracks `llama-eval-callback` within 1-3% through
    all 45 layers (that gap is llama.cpp's Q8_1 activation quantization: `glm-ssd ref-l0`, an
    independent f64 CPU reference, agrees with our GPU path to 6 digits on layer 0 while llama.cpp
    is off by up to 20% where KDA's k.q is ill-conditioned). Chat prompt "What is the capital of
    France?" -> "The capital of France is **Paris**." + EOS. ~1.1 tok/s with no expert cache.
-   Tokenizer (byte-level BPE, chatglm4 regex): `glm-ssd tokenize`. DSA sparse path (>2048
-   tokens) not yet exercised.
-4. **M3** the streaming engine: async SSD reader, two-tier expert cache, prefetch, budgets.
-5. **M4** tokenizer (GLM BPE from GGUF) + chat template + sampler + **CLI chat**.
-6. **M5** chunked prefill, CUDA graphs for decode.
-7. **M6** OpenAI-compatible HTTP server (streaming).
-8. **M7** prompt/prefix caching (MLA latents + KDA/conv state snapshots at checkpoints).
-9. **M8** MTP speculative decoding.
-10. **M9** learned hot-expert profile (persisted usage stats → preload).
-11. **M10** long-context: KDA chunked scan for prefill, efficient indexer/top-k, 128K+ contexts.
+   Tokenizer (byte-level BPE, chatglm4 regex): `glm-ssd tokenize`.
+4. **M3** streaming engine ✅ (`experts.rs`): VRAM + pinned-RAM expert slots per size class,
+   decayed-frequency eviction (half-life ~350 tokens), RAM evicts experts already in VRAM first
+   (mostly exclusive tiers without D2H copies), direct I/O reader pool (8 threads, each expert's
+   3 extents read in parallel, demand > prefetch priority), copy stream + events so uploads
+   overlap compute, decode prefetch of the next layer's top-2 predicted experts (96% accurate).
+   `--vram-budget` is the engine's total VRAM; what weights/caches/scratch leave is expert cache.
+5. **M4** CLI chat ✅: the GGUF's Jinja template rendered by minijinja (+pycompat), streaming
+   detokenizer that splits reasoning / content / tool calls, sampler (temp, top-k/p, min-p).
+6. **M5** batched prefill ✅: the forward pass runs T tokens per call; T > 8 uses a tensor-core
+   GEMM that dequantizes weight tiles on the fly (WMMA f16, f32 accumulation; checked against
+   the CPU reference for every quant type in `qtest`). MoE groups tokens per expert, so each
+   expert is read once per chunk. CUDA graphs were dropped: decode syncs with the host at every
+   MoE layer to route (the host must issue the SSD reads), and launch overhead is ~3% of a token.
+7. **M6** OpenAI-compatible server ✅ (`serve`): /v1/chat/completions (SSE streaming with
+   `reasoning_content` deltas, tools <-> GLM `<tool_call>` XML), /v1/completions, /v1/models.
+8. **M7** prefix caching ✅ (`session.rs`): attention caches are position-indexed, so a shared
+   prefix is reused as-is; KDA/conv states + indexer rings + the MTP pending row are snapshotted
+   (~150 MB, host RAM) at the end of every prompt and every 8K prefill tokens; a request restores
+   the newest snapshot at or before its divergence point.
+9. **M8** MTP speculative decoding ✅ (`--mtp`): the NextN layer drafts 1 token, the trunk verifies
+   [cur, draft] in one T=2 pass; on rejection the KDA/conv states saved after the first token are
+   restored. The MTP layer's attention cache is fed during prefill too. Exact for any sampler
+   (accept iff the sampled token equals the draft).
+10. **M9** hot-expert profile ✅: lifetime use counts in `hot-experts.txt` seed the eviction
+    scores; `--preload` fills both tiers from it at start (~26 GB in 5.4 s).
+11. **M10** long context ✅: f16 MLA latent cache, indexer raw rows kept only in a 4-row ring
+    (pooled keys per 4 tokens are what persists), GPU indexer scoring + exact radix top-k per
+    query, flash-style MLA attention over the selected positions. The KDA prefill scan keeps each
+    head's 128x128 state in registers and walks tokens sequentially (~ms per layer per chunk), so
+    a chunked/WY scan was not needed. 131K context allocates fine on a 24 GB card.
+
+### Results (RTX 3090, 990 PRO, 22G VRAM / 12G RAM budgets, cold caches, no profile)
+
+| | |
+|---|---|
+| decode, steady state | 5.6 tok/s (5.9 with `--mtp`, 81% accepted on prose, 98% on lists) |
+| prefill | 58 tok/s (chunk 1024, 3.5K prompt), 122 tok/s (chunk 2048, 17K prompt) |
+| long context | needles retrieved at 3.5K and 17K tokens (sparse DSA path), ctx 131072 |
+| expert hit rate (decode) | ~60% VRAM + ~14% RAM, rest from SSD at ~6 GB/s |
+
+Decode is SSD-bandwidth bound (~0.8 GB of expert misses per token); more cache budget is the
+main lever. Prefill streams nearly every expert once per chunk, so bigger chunks are faster.
 
 ## References (read-only, in `ref/`, not part of the build)
 

@@ -6,3 +6,5 @@
 download.log
 /testdata
 /.claude/settings.local.json
+/hot-experts.txt
+/hot-experts.tmp

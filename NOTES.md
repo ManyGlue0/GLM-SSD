@@ -3,21 +3,38 @@
 Working notes that are not obvious from the code. DESIGN.md has the architecture, roadmap and
 measurements; this file has *state, gotchas and the exact plan for the next step*.
 
-## Current state (2026-11-01)
+## Current state (2026-11-02)
 
-- M0, M1, M2 done (M2 validated 2026-11-01, see DESIGN.md roadmap). Next: M3.
+- M0-M10 implemented and tested end to end (see DESIGN.md roadmap + results). Usage in README.
 - Model: all 4 shards in `models/UD-IQ2_XXS/`, SHA-256 verified against HF (sha256sum -c).
-  (hfdl aborted at 100% on a state-save race, fixed in 20a10ac; the files were already fine.)
 - Reference: llama.cpp master @785322d in `ref/llama.cpp` (gitignored), CUDA build done:
-  `ref/llama.cpp/build/bin/Release/llama-eval-callback.exe`. (`llama-cli`/`llama-perplexity`
-  targets don't exist in this version: cli became `llama-app`; not needed.)
+  `ref/llama.cpp/build/bin/Release/llama-eval-callback.exe` (no `--no-warmup` flag).
 - Permissions: auto-mode classifier blocks building/running code from `ref/` ("Code from
   External"). The user added allow rules in `.claude/settings.local.json` (gitignored) for:
   `cmake -S ref/llama.cpp *`, `cmake --build ref/llama.cpp/build *`, the three
   `./ref/llama.cpp/build/bin/Release/llama-*.exe *` binaries, and the scratchpad venv python
   running `tools/qref.py`. **Run those commands plainly (no `cd … &&` prefix) so rules match.**
-- Python venv with numpy+pyyaml (for gguf-py): session scratchpad `qenv/` (path in settings rule).
-  `tools/qref.py` already verified: CPU dequant == gguf-py bit-exact (15 vector sets).
+- Machine during testing: ~18 GB RAM free of 32 -> tests used `--ram-budget 12G`.
+
+### How things were tested (rerun after changes)
+- `glm-ssd qtest -m <shard2>`: dequant / GEMV / GEMM vs CPU reference, all quant types.
+- `glm-ssd run --prompt "[gMASK]<sop><|user|>
+What is the capital of France?<|assistant|>
+<think></think>"`
+  -> "The capital of France is **Paris**." (`--sequential` reproduces the validated M2 logits
+  exactly; the batched GEMM path differs ~1% from f16 activation rounding).
+- Needle tests via `run --prompt-file` (3.5K and 17K tokens) exercise the sparse DSA path.
+- `bench` for decode speed; `chat` with piped stdin; `serve` + curl (stream, tools, tool result
+  round trip: 160/201 prompt tokens reused from the snapshot).
+
+### Known limits / ideas
+- Decode is SSD-bound (~0.8 GB misses/token at ~6 GB/s). Options: bigger budgets; per-expert
+  contiguous repack (+~15% read throughput); CPU compute for RAM-resident experts (avoids PCIe).
+- Prefill compute is ~half the time at chunk 2048 (I/O the other half): GEMM tiles are 64x64 and
+  MoE groups are small (~57 tokens/expert); a split-K or larger-N kernel would help.
+- Speculative prefetch with larger K hurts (wrong guesses steal SSD bandwidth); K=2 is neutral-positive.
+- Server handles one request at a time (single sequence engine).
+- Expert cache tiers can't hand experts down VRAM -> RAM (single copy engine on this GPU/driver).
 
 ## M2 validation recipe (done once; rerun after changing the forward pass)
 
@@ -67,13 +84,6 @@ position. llama-eval-callback has no `--no-warmup` flag in this version.
   applies to routed experts (clamp_exp), shared expert AND dense layers 0-2 (clamp_shexp).
 - Expert tensor slices: `[in, out, 288]`, expert e = contiguous bytes n_bytes/288 * e.
 
-## Known simplifications in the M2 code (to revisit)
-- Prompt processed one token at a time (no batched prefill yet) -> slow prompts.
-- MLA latent + indexer caches are f32 (switch to f16 for long contexts).
-- MTP layer 45 not loaded (`Weights::load(.., cfg.n_layer)`).
-- No expert caching: 8 synchronous parallel reads per MoE layer through the OS file cache.
-- Router top-k and indexer top-k on the host (one sync per MoE layer).
-
 ## Build / tooling gotchas (cost time once already)
 - `cc` adds `-G` (device debug, no optimization: 60x slower kernels) when the cargo profile has
   debug info -> `b.debug(false)` in crates/cuda/build.rs. Keep it.
@@ -86,10 +96,10 @@ position. llama-eval-callback has no `--no-warmup` flag in this version.
 - Nsight Compute: use `.../target/windows-desktop-win7-x64/ncu.exe` directly (the .bat breaks
   args), `--kernel-name-base demangled --kernel-name "regex:QIQ2_XXS, \(int\)1>"`.
 
-## M3 notes (next milestone after validation)
-- Direct reads: `io::open_direct` (FILE_FLAG_NO_BUFFERING); 4 KiB-aligned windows; 1-2 reader
-  threads already saturate the 990 PRO at ~5.5 GB/s for 7 MiB reads (see DESIGN.md table).
-- Expert unit sizes: 7.19 MiB (most layers), 8.38 (12, 44), 9.38 (11), 8.69 (45/MTP).
-- Plan: exclusive VRAM + pinned-RAM caches keyed by (layer, expert); frequency+recency eviction;
-  speculative prefetch by running layer L+1's router on layer L's hidden state; optional
-  one-time repack to per-expert contiguous layout (+~15% read throughput).
+## Engine invariants worth remembering
+- `Engine::pos` == number of tokens whose state is in the caches; `Session::history` mirrors it.
+- MTP: `mtp_pos` is the next MTP position; exactly one "pending" row (hidden of the last trunk
+  position, waiting for its next token) exists after a prefill or a finished generation.
+- Snapshots are invalidated when a request diverges before them (positions get overwritten).
+- Expert slot reuse is guarded by events: RAM slot -> its last H2D; VRAM slot -> its last use.
+- Each MoE size class (7.19 / 8.38 / 8.69 / 9.38 MiB) has its own slot pools (>= 24 slots each).

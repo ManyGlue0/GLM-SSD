@@ -769,12 +769,13 @@ impl Engine {
         }
 
         // speculative prefetch for the next MoE layer during decode
-        if let Some((r2, b2)) = next_router.filter(|_| t <= 2) {
+        let pk = self.experts.prefetch_k;
+        if let Some((r2, b2)) = next_router.filter(|_| t <= 2 && pk > 0) {
             self.mm(&r2, xn, self.router.f32(), t)?;
             let mut l2 = vec![0f32; t * ne];
             self.router.download(0, bytes_of_mut(&mut l2), &self.s)?;
             self.s.sync()?;
-            let mut guess: Vec<u16> = self.route(&b2, &l2, t).into_iter().flatten().map(|x| x.0).collect();
+            let mut guess: Vec<u16> = self.route(&b2, &l2, t).into_iter().flat_map(|r| r.into_iter().take(pk)).map(|x| x.0).collect();
             guess.sort_unstable();
             guess.dedup();
             self.experts.prefetch(il + 1, &guess);

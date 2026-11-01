@@ -77,7 +77,7 @@ struct EngineArgs {
     #[arg(long)]
     mtp: bool,
     /// SSD reader threads
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 8)]
     io_threads: usize,
     /// Learned hot-expert profile (read at start for cache priorities, updated on exit)
     #[arg(long, default_value = "hot-experts.txt")]
@@ -94,6 +94,9 @@ struct EngineArgs {
     /// Max prompt-cache snapshots kept in RAM (~150 MB each)
     #[arg(long, default_value_t = 6)]
     snapshots: usize,
+    /// Decode: prefetch this many of the next layer's predicted experts (0 = off)
+    #[arg(long, default_value_t = 2)]
+    prefetch: usize,
 }
 
 #[derive(clap::Args, Clone)]
@@ -142,6 +145,9 @@ enum Cmd {
         /// Prompt text (special tokens like <|user|> are parsed)
         #[arg(long)]
         prompt: Option<String>,
+        /// Read the prompt text from a file
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         /// Tokens to generate (greedy)
         #[arg(short = 'n', long, default_value_t = 16)]
         n_predict: usize,
@@ -188,6 +194,16 @@ enum Cmd {
         /// Default max tokens when the request has none
         #[arg(long, default_value_t = 16384)]
         max_tokens: usize,
+    },
+    /// Decode benchmark: chat prompt -> N generated tokens (greedy), steady-state speed
+    Bench {
+        #[command(flatten)]
+        eng: EngineArgs,
+        /// User message
+        #[arg(long, default_value = "Write a detailed essay about the history of the printing press.")]
+        message: String,
+        #[arg(short = 'n', long, default_value_t = 200)]
+        n_gen: usize,
     },
     /// f64 CPU reference of layer 0 (KDA + mHC) for one token, to arbitrate GPU vs llama.cpp
     RefL0 {
@@ -274,9 +290,14 @@ fn main() -> Result<()> {
             let cfg = config::Config::from_gguf(&g)?;
             refcheck::layer0(&g, &cfg, token)?;
         }
-        Cmd::Run { eng, tokens, prompt, n_predict, sequential, trace, top } => {
+        Cmd::Run { eng, tokens, prompt, prompt_file, n_predict, sequential, trace, top } => {
+            let prompt = match prompt_file {
+                Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?),
+                None => prompt,
+            };
             run(&eng, tokens.as_deref(), prompt.as_deref(), n_predict, sequential, trace, top)?
         }
+        Cmd::Bench { eng, message, n_gen } => bench(&eng, &message, n_gen)?,
         Cmd::Chat { eng, sample, system, effort, hide_think, max_tokens } => {
             chat_repl(&eng, &sample, system, effort, hide_think, max_tokens)?
         }
@@ -338,6 +359,7 @@ fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
         chunk: a.chunk,
         mtp: a.mtp,
         cache: experts::CacheConfig {
+            prefetch: a.prefetch,
             vram_bytes: vram,
             ram_bytes: ram_cache,
             io_threads: a.io_threads,
@@ -538,6 +560,41 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
 }
 
 fn finish(sess: &mut session::Session) -> Result<()> {
+    sess.eng.experts.save_profile()?;
+    Ok(())
+}
+
+fn bench(a: &EngineArgs, message: &str, n_gen: usize) -> Result<()> {
+    let (g, mut sess) = start(a)?;
+    let vocab = tokenizer::Vocab::from_gguf(&g)?;
+    let tmpl = chat::ChatTemplate::from_gguf(&g)?;
+    let prompt = tmpl.render(&json!([{"role": "user", "content": message}]), None, Some("low"), true)?;
+    let toks = vocab.encode(&prompt, true);
+    let mut stats = session::GenStats::default();
+    let logits = sess.prefill(&toks, &mut stats, |_, _| {})?;
+    let mut sampler = session::Sampler::new(session::SamplerCfg { temperature: 0.0, ..Default::default() });
+    let mut times = Vec::new();
+    let t0 = std::time::Instant::now();
+    let mut text = Vec::new();
+    let eos = sess.eng.cfg.eos.clone();
+    let mut snap = None;
+    sess.generate(logits, n_gen, &mut sampler, &mut stats, |tok| {
+        times.push(t0.elapsed().as_secs_f64());
+        text.push(tok);
+        if times.len() == n_gen / 2 {
+            snap = Some(std::time::Instant::now());
+        }
+        !eos.contains(&tok)
+    })?;
+    let n = times.len();
+    let half = n / 2;
+    let steady = if n > 4 { (n - half) as f64 / (times[n - 1] - times[half - 1]).max(1e-9) } else { 0.0 };
+    println!("{}", vocab.decode(&text).chars().take(400).collect::<String>());
+    println!("
+{}", stats.line());
+    println!("steady-state decode (2nd half): {steady:.2} tok/s");
+    println!("{}", sess.eng.experts.summary());
+    let _ = snap;
     sess.eng.experts.save_profile()?;
     Ok(())
 }

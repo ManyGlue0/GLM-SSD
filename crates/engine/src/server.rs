@@ -94,12 +94,23 @@ struct Sse {
     ok: bool,
 }
 impl Sse {
-    fn send(&mut self, v: &Json) -> bool {
+    /// One SSE event = one HTTP chunk (chunked transfer encoding marks the end of the response
+    /// explicitly, independent of what the HTTP library does with the socket afterwards).
+    fn raw(&mut self, payload: &str) -> bool {
         if self.ok {
-            let r = write!(self.w, "data: {v}\n\n").and_then(|_| self.w.flush());
+            let r = write!(self.w, "{:x}\r\n{payload}\r\n", payload.len()).and_then(|_| self.w.flush());
             self.ok = r.is_ok();
         }
         self.ok
+    }
+    fn send(&mut self, v: &Json) -> bool {
+        self.raw(&format!("data: {v}\n\n"))
+    }
+    fn end(&mut self) {
+        if self.ok {
+            self.raw("data: [DONE]\n\n");
+            let _ = write!(self.w, "0\r\n\r\n").and_then(|_| self.w.flush());
+        }
     }
 }
 
@@ -152,7 +163,7 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
         let mut w = req.into_writer();
         write!(
             w,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
         )?;
         w.flush()?;
         let mut sse = Sse { w, ok: true };
@@ -251,6 +262,9 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
             "function": {"name": c.name, "arguments": c.arguments.to_string()}}))
         .collect();
     eprintln!("[{}] {} | {}", rid, stats.line(), s.session.eng.experts.summary());
+    if let Err(e) = s.session.eng.experts.save_profile() {
+        eprintln!("warning: saving the hot-expert profile: {e:#}");
+    }
     let _ = t0;
 
     if let Some(mut sse) = sse {
@@ -268,9 +282,7 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
         if include_usage {
             sse.send(&json!({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [], "usage": usage}));
         }
-        if sse.ok {
-            let _ = write!(sse.w, "data: [DONE]\n\n").and_then(|_| sse.w.flush());
-        }
+        sse.end();
         return Ok(());
     }
     let req = req_opt.context("request already answered")?;

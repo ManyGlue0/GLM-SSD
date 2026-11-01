@@ -135,20 +135,25 @@ impl IoPool {
         }
         Ok(Self { q, done: rx, threads, next_id: 1 })
     }
+    /// Queue the reads of one expert; each extent is its own request so the slices of one
+    /// expert load in parallel. Completion messages arrive once per extent.
     fn submit(&mut self, reads: Vec<(usize, u64, usize, usize)>, hi: bool) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let (m, cv) = &*self.q;
         let mut g = m.lock().unwrap();
-        if hi { g.hi.push_back(Req { id, reads }) } else { g.lo.push_back(Req { id, reads }) }
-        cv.notify_one();
+        for r in reads {
+            let req = Req { id, reads: vec![r] };
+            if hi { g.hi.push_back(req) } else { g.lo.push_back(req) }
+        }
+        cv.notify_all();
         id
     }
     /// Move a queued low-priority request to the high queue (a prefetch became a demand).
     fn promote(&self, id: u64) {
         let (m, _) = &*self.q;
         let mut g = m.lock().unwrap();
-        if let Some(i) = g.lo.iter().position(|r| r.id == id) {
+        while let Some(i) = g.lo.iter().position(|r| r.id == id) {
             let r = g.lo.remove(i).unwrap();
             g.hi.push_front(r);
         }
@@ -227,8 +232,9 @@ pub struct ExpertCache {
     freq: HashMap<Key, (f32, u64)>, // decayed frequency, last use (token clock)
     prior: HashMap<Key, f32>,
     protect: HashSet<Key>,
-    loading: HashMap<u64, (usize, usize)>, // request id -> (class, ram slot)
+    loading: HashMap<u64, (usize, usize, u8)>, // request id -> (class, ram slot, extents left)
     prefetch_ids: HashSet<u64>,
+    pub prefetch_k: usize,
     io: IoPool,
     now: u64,
     pub stats: Stats,
@@ -240,6 +246,8 @@ pub struct ExpertCache {
 unsafe impl Send for ExpertCache {}
 
 pub struct CacheConfig {
+    /// predicted experts prefetched per layer during decode (0 = off)
+    pub prefetch: usize,
     pub vram_bytes: u64,
     pub ram_bytes: u64,
     pub io_threads: usize,
@@ -299,6 +307,7 @@ impl ExpertCache {
             protect: HashSet::new(),
             loading: HashMap::new(),
             prefetch_ids: HashSet::new(),
+            prefetch_k: cfg.prefetch,
             io,
             now: 0,
             stats: Stats::default(),
@@ -485,7 +494,7 @@ impl ExpertCache {
         s.state = RState::Loading(id);
         s.prefetched = !hi;
         self.ram_map.insert(k, slot);
-        self.loading.insert(id, (c, slot));
+        self.loading.insert(id, (c, slot, 3));
         if !hi {
             self.prefetch_ids.insert(id);
             self.stats.prefetch_issued += 1;
@@ -493,30 +502,42 @@ impl ExpertCache {
         Some(id)
     }
 
-    /// Handle one finished read (blocking if `block`). Returns the request id.
+    /// Handle one finished expert (all its extents read; blocking if `block`). Returns its id.
     fn complete_one(&mut self, block: bool) -> Result<Option<u64>> {
-        let msg = if block {
-            let t0 = Instant::now();
-            let m = self.io.done.recv().map_err(|_| anyhow!("expert reader threads died"))?;
-            self.stats.read_time += t0.elapsed();
-            m
-        } else {
-            match self.io.done.try_recv() {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
+        loop {
+            let msg = if block {
+                let t0 = Instant::now();
+                let m = self.io.done.recv().map_err(|_| anyhow!("expert reader threads died"))?;
+                self.stats.read_time += t0.elapsed();
+                m
+            } else {
+                match self.io.done.try_recv() {
+                    Ok(m) => m,
+                    Err(_) => return Ok(None),
+                }
+            };
+            let (id, res) = msg;
+            let bytes = res.map_err(|e| anyhow!(e))?;
+            self.stats.read_bytes += bytes;
+            match self.loading.get_mut(&id) {
+                Some(l) if l.2 > 1 => {
+                    l.2 -= 1;
+                    continue; // more extents of this expert outstanding
+                }
+                _ => return self.finish_load(id).map(Some),
             }
-        };
-        let (id, res) = msg;
-        let bytes = res.map_err(|e| anyhow!(e))?;
-        self.stats.read_bytes += bytes;
+        }
+    }
+
+    fn finish_load(&mut self, id: u64) -> Result<u64> {
         self.prefetch_ids.remove(&id);
-        if let Some((c, slot)) = self.loading.remove(&id) {
+        if let Some((c, slot, _)) = self.loading.remove(&id) {
             let s = &mut self.classes[c].ram[slot];
             if s.state == RState::Loading(id) {
                 s.state = RState::Ready;
             }
         }
-        Ok(Some(id))
+        Ok(id)
     }
 
     /// Start getting `experts` of `layer` onto the GPU.
@@ -704,7 +725,7 @@ impl ExpertCache {
                 s.state = RState::Loading(id);
                 s.prefetched = false;
                 self.ram_map.insert(*k, slot);
-                self.loading.insert(id, (c, slot));
+                self.loading.insert(id, (c, slot, 3));
                 self.protect.insert(*k);
             }
             for _ in chunk {
