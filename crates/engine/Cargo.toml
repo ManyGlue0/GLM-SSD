@@ -13,3 +13,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 gguf = { path = "../gguf" }
 cuda = { path = "../cuda" }
+quants = { path = "../quants" }

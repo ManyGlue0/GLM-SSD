@@ -78,10 +78,12 @@ much of the remaining SSD traffic can be hidden behind compute.
 
 ## Roadmap
 
-1. **M0** workspace, GGUF reader, `inspect` placement planner, CUDA build pipeline. ✅ in progress
+1. **M0** workspace, GGUF reader, `inspect` placement planner, CUDA build pipeline. ✅
 2. **M1** dequant + matvec kernels for every quant type in the file
-   (Q4_K Q5_K Q6_K Q8_0 IQ2_XXS IQ2_S IQ3_XXS IQ4_XS Q2_K Q3_K F32), tested against a CPU
-   reference and gguf-py.
+   (Q4_K Q5_K Q6_K Q8_0 IQ2_XXS IQ2_S IQ3_XXS IQ4_XS Q2_K Q3_K F32/F16). ✅
+   `glm-ssd qtest` checks them bit-exact against the CPU port (`crates/quants`) on random and
+   real blocks; `glm-ssd qbench` measures GEMV bandwidth (IQ2_XXS ~200-270 GB/s, IQ3_XXS ~400,
+   Q8_0/F16 ~800 of 936 GB/s at batch 1). Batch 4-8 is input-load bound -> int8 x + dp4a in M5.
 3. **M2** correct forward pass (slow path) — mHC, KDA, nope-MLA+indexer, MoE, head.
    Validate logits against llama.cpp master (which supports `glm5-next`) on fixed prompts.
 4. **M3** the streaming engine: async SSD reader, two-tier expert cache, prefetch, budgets.

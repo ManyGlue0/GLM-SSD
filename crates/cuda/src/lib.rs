@@ -46,6 +46,43 @@ pub mod ffi {
         pub fn gs_stream_wait_event(s: *mut c_void, e: *mut c_void) -> i32;
         pub fn gs_event_elapsed_ms(ms: *mut f32, a: *mut c_void, b: *mut c_void) -> i32;
         pub fn gs_saxpy(n: i32, a: f32, x: *const f32, y: *mut f32, s: *mut c_void) -> i32;
+
+        pub fn gs_dequant_f32(ty: i32, src: *const c_void, n: i64, dst: *mut f32, s: *mut c_void) -> i32;
+        pub fn gs_dequant_f16(ty: i32, src: *const c_void, n: i64, dst: *mut c_void, s: *mut c_void) -> i32;
+        pub fn gs_gemv(
+            ty: i32, w: *const c_void, row_stride: i64, k: i32, rows: i32, x: *const f32, x_stride: i64,
+            y: *mut f32, y_stride: i64, b: i32, accumulate: i32, s: *mut c_void,
+        ) -> i32;
+    }
+}
+
+/// Quantized ops. All pointers are device pointers; `ty` is the ggml type id.
+pub mod ops {
+    use super::*;
+
+    /// Dequantize `n` elements of type `ty` at `src` into f32 at `dst`.
+    pub fn dequant_f32(ty: u32, src: *const c_void, n: usize, dst: *mut f32, s: &Stream) -> Result<()> {
+        check(unsafe { ffi::gs_dequant_f32(ty as i32, src, n as i64, dst, s.raw()) })
+    }
+
+    /// Dequantize into f16.
+    pub fn dequant_f16(ty: u32, src: *const c_void, n: usize, dst: *mut c_void, s: &Stream) -> Result<()> {
+        check(unsafe { ffi::gs_dequant_f16(ty as i32, src, n as i64, dst, s.raw()) })
+    }
+
+    /// `y[b][r] (+)= W[r] · x[b]` for `b < n_vec` (1..=8).
+    /// W is `rows` rows of `k` elements, `row_stride` bytes apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv(
+        ty: u32, w: *const c_void, row_stride: usize, k: usize, rows: usize, x: *const f32, x_stride: usize,
+        y: *mut f32, y_stride: usize, n_vec: usize, accumulate: bool, s: &Stream,
+    ) -> Result<()> {
+        check(unsafe {
+            ffi::gs_gemv(
+                ty as i32, w, row_stride as i64, k as i32, rows as i32, x, x_stride as i64, y, y_stride as i64,
+                n_vec as i32, accumulate as i32, s.raw(),
+            )
+        })
     }
 }
 
@@ -101,6 +138,35 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         unsafe { ffi::gs_stream_destroy(self.0) };
+    }
+}
+
+/// CUDA event with timing enabled.
+pub struct Event(*mut c_void);
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+impl Event {
+    pub fn timed() -> Result<Self> {
+        let mut e = std::ptr::null_mut();
+        check(unsafe { ffi::gs_event_create_timed(&mut e) })?;
+        Ok(Self(e))
+    }
+    pub fn record(&self, s: &Stream) -> Result<()> {
+        check(unsafe { ffi::gs_event_record(self.0, s.0) })
+    }
+    pub fn sync(&self) -> Result<()> {
+        check(unsafe { ffi::gs_event_sync(self.0) })
+    }
+    /// Milliseconds from `self` to `later` (both must be recorded and complete).
+    pub fn elapsed_ms(&self, later: &Event) -> Result<f32> {
+        let mut ms = 0f32;
+        check(unsafe { ffi::gs_event_elapsed_ms(&mut ms, self.0, later.0) })?;
+        Ok(ms)
+    }
+}
+impl Drop for Event {
+    fn drop(&mut self) {
+        unsafe { ffi::gs_event_destroy(self.0) };
     }
 }
 

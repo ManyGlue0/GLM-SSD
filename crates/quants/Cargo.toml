@@ -1,0 +1,9 @@
+[package]
+name = "quants"
+version = "0.1.0"
+edition = "2021"
+description = "CPU reference (de)quantization for the GGML types used by GLM-5.3-Flash GGUFs"
+
+[dependencies]
+gguf = { path = "../gguf" }
+anyhow = "1"

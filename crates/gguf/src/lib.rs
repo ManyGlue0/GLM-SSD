@@ -112,6 +112,13 @@ impl Gguf {
         Self::open_impl(path, false)
     }
 
+    /// Open exactly one file (one shard of a split model), without looking for siblings.
+    pub fn open_shard(path: &Path) -> Result<Self> {
+        let (kv, tensors) = read_header(path, 0, true)?;
+        let by_name = tensors.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
+        Ok(Self { shards: vec![path.to_path_buf()], kv, tensors, by_name })
+    }
+
     fn open_impl(path: &Path, check_len: bool) -> Result<Self> {
         let shards = discover_shards(path)?;
         let mut kv = HashMap::new();

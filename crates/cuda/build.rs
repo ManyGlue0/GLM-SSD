@@ -21,12 +21,16 @@ fn main() {
     if let Some(ccbin) = find_msvc_bin() {
         std::env::set_var("NVCC_CCBIN", &ccbin);
     }
+    // Never let cc add -G (device debug = no optimization) because the profile has debug info.
+    b.debug(false).opt_level(3);
+    // cc cannot classify nvcc as a compiler family and warns about it on every build
+    b.cargo_warnings(false);
     b.cuda(true)
         .cudart("static")
         .flag(format!("-arch={arch}"))
         .flag("-O3")
         .flag("--use_fast_math")
-        .flag("-std=c++17")
+        .flag("-std=c++20")
         .flag("-lineinfo")
         .flag("-Xcompiler=/MD") // match Rust's MSVC CRT
         .include("kernels");

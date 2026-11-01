@@ -1,5 +1,6 @@
 mod config;
 mod plan;
+mod qtest;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -47,6 +48,14 @@ struct BudgetArgs {
 enum Cmd {
     /// Show GPU info and run a CUDA smoke test
     Gpu,
+    /// Cross-check CUDA quant kernels against the CPU reference
+    Qtest {
+        /// Also test real tensors from this (fully downloaded) model
+        #[arg(short, long)]
+        model: Option<PathBuf>,
+    },
+    /// Benchmark the quantized GEMV kernels
+    Qbench,
     /// Print model structure and the memory placement plan for the given budgets
     Inspect {
         #[command(flatten)]
@@ -72,6 +81,8 @@ fn main() -> Result<()> {
             cuda::smoke_test()?;
             println!("CUDA smoke test OK");
         }
+        Cmd::Qtest { model } => qtest::run(model.as_deref())?,
+        Cmd::Qbench => qtest::bench()?,
         Cmd::Inspect { model, budget, tensors } => {
             let g = if model.headers_only {
                 gguf::Gguf::open_headers_only(&model.model)?
