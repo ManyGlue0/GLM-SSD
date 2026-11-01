@@ -1,5 +1,6 @@
 mod config;
 mod forward;
+mod io;
 mod model;
 mod plan;
 mod qtest;
@@ -89,6 +90,16 @@ enum Cmd {
         /// Text to encode; special tokens like <|user|> are parsed
         text: String,
     },
+    /// Benchmark direct (unbuffered) random reads of expert-sized blocks from a file
+    Iobench {
+        file: PathBuf,
+        /// Read size in MiB (one expert is ~7.2 MiB)
+        #[arg(long, default_value_t = 7.2)]
+        mib: f64,
+        /// Seconds per thread count
+        #[arg(long, default_value_t = 4.0)]
+        secs: f64,
+    },
     /// Print model structure and the memory placement plan for the given budgets
     Inspect {
         #[command(flatten)]
@@ -119,6 +130,7 @@ fn main() -> Result<()> {
             None => qtest::run(model.as_deref())?,
         },
         Cmd::Qbench => qtest::bench()?,
+        Cmd::Iobench { file, mib, secs } => io::bench(&file, (mib * 1048576.0) as usize, secs)?,
         Cmd::Tokenize { model, text } => {
             let g = gguf::Gguf::open_shard(&model)?;
             let v = tokenizer::Vocab::from_gguf(&g)?;

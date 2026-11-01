@@ -76,6 +76,25 @@ much of the remaining SSD traffic can be hidden behind compute.
   tokens (I/O is amortized → hundreds of tok/s).
 - **Budgets**: `--vram-budget` / `--ram-budget` flags (required by design, no presets).
 
+## Measurements
+
+**SSD (990 PRO, `glm-ssd iobench`, unbuffered random reads):**
+
+| read size | 1 thread | best |
+|---|---|---|
+| 7.2 MiB (whole expert) | 5.49 GB/s, 1.4 ms | 5.72 GB/s (4 threads) |
+| 2.1 MiB (one gate/up slice) | 4.61 GB/s, 0.5 ms | 4.87 GB/s (2 threads) |
+
+- One expert costs ~1.3 ms from SSD; the drive saturates at queue depth 1-2 for multi-MB reads,
+  so the reader needs few threads and should keep requests large.
+- Per-expert-contiguous storage (one read instead of three) would gain ~15% -> optional one-time
+  repack in M3 (costs ~95 GB extra disk while the GGUF is kept for reference runs).
+- Uncached worst case: 336 experts x 1.3 ms = 0.44 s/token (~2.3 tok/s). Every cache hit removes
+  1.3 ms; at a 60% hit rate the SSD floor is ~0.18 s/token (~5.5 tok/s) before overlap with compute.
+
+**GEMV (`glm-ssd qbench`, batch 1):** IQ2_XXS ~200-270 GB/s, IQ3_XXS ~400 GB/s, Q8_0/F16 ~800 GB/s
+-> all 336 routed experts of one token take ~8 ms of GPU time once they are in VRAM.
+
 ## Roadmap
 
 1. **M0** workspace, GGUF reader, `inspect` placement planner, CUDA build pipeline. ✅
@@ -84,8 +103,9 @@ much of the remaining SSD traffic can be hidden behind compute.
    `glm-ssd qtest` checks them bit-exact against the CPU port (`crates/quants`) on random and
    real blocks; `glm-ssd qbench` measures GEMV bandwidth (IQ2_XXS ~200-270 GB/s, IQ3_XXS ~400,
    Q8_0/F16 ~800 of 936 GB/s at batch 1). Batch 4-8 is input-load bound -> int8 x + dp4a in M5.
-3. **M2** correct forward pass (slow path) — mHC, KDA, nope-MLA+indexer, MoE, head.
-   Validate logits against llama.cpp master (which supports `glm5-next`) on fixed prompts.
+3. **M2** correct forward pass (slow path) — mHC, KDA, nope-MLA+indexer, MoE, head. **written,
+   awaiting validation**: `glm-ssd run --trace` vs `llama-eval-callback` on the same tokens.
+   Tokenizer (byte-level BPE, chatglm4 regex) done early: `glm-ssd tokenize`.
 4. **M3** the streaming engine: async SSD reader, two-tier expert cache, prefetch, budgets.
 5. **M4** tokenizer (GLM BPE from GGUF) + chat template + sampler + **CLI chat**.
 6. **M5** chunked prefill, CUDA graphs for decode.
