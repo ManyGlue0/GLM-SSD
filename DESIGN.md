@@ -103,9 +103,14 @@ much of the remaining SSD traffic can be hidden behind compute.
    `glm-ssd qtest` checks them bit-exact against the CPU port (`crates/quants`) on random and
    real blocks; `glm-ssd qbench` measures GEMV bandwidth (IQ2_XXS ~200-270 GB/s, IQ3_XXS ~400,
    Q8_0/F16 ~800 of 936 GB/s at batch 1). Batch 4-8 is input-load bound -> int8 x + dp4a in M5.
-3. **M2** correct forward pass (slow path) — mHC, KDA, nope-MLA+indexer, MoE, head. **written,
-   awaiting validation**: `glm-ssd run --trace` vs `llama-eval-callback` on the same tokens.
-   Tokenizer (byte-level BPE, chatglm4 regex) done early: `glm-ssd tokenize`.
+3. **M2** correct forward pass (slow path) — mHC, KDA, nope-MLA+indexer, MoE, head. ✅
+   Validated 2026-11-01: `glm-ssd run --trace` tracks `llama-eval-callback` within 1-3% through
+   all 45 layers (that gap is llama.cpp's Q8_1 activation quantization: `glm-ssd ref-l0`, an
+   independent f64 CPU reference, agrees with our GPU path to 6 digits on layer 0 while llama.cpp
+   is off by up to 20% where KDA's k.q is ill-conditioned). Chat prompt "What is the capital of
+   France?" -> "The capital of France is **Paris**." + EOS. ~1.1 tok/s with no expert cache.
+   Tokenizer (byte-level BPE, chatglm4 regex): `glm-ssd tokenize`. DSA sparse path (>2048
+   tokens) not yet exercised.
 4. **M3** the streaming engine: async SSD reader, two-tier expert cache, prefetch, budgets.
 5. **M4** tokenizer (GLM BPE from GGUF) + chat template + sampler + **CLI chat**.
 6. **M5** chunked prefill, CUDA graphs for decode.

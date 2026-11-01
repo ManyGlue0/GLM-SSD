@@ -4,6 +4,7 @@ mod io;
 mod model;
 mod plan;
 mod qtest;
+mod refcheck;
 mod tokenizer;
 
 use anyhow::Result;
@@ -83,6 +84,13 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         top: usize,
     },
+    /// f64 CPU reference of layer 0 (KDA + mHC) for one token, to arbitrate GPU vs llama.cpp
+    RefL0 {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[arg(long, default_value_t = 785)]
+        token: u32,
+    },
     /// Tokenize text with the model's tokenizer (only needs the first shard)
     Tokenize {
         #[arg(short, long, default_value = DEFAULT_MODEL)]
@@ -130,6 +138,11 @@ fn main() -> Result<()> {
             None => qtest::run(model.as_deref())?,
         },
         Cmd::Qbench => qtest::bench()?,
+        Cmd::RefL0 { model, token } => {
+            let g = gguf::Gguf::open(&model.model)?;
+            let cfg = config::Config::from_gguf(&g)?;
+            refcheck::layer0(&g, &cfg, token)?;
+        }
         Cmd::Iobench { file, mib, secs } => io::bench(&file, (mib * 1048576.0) as usize, secs)?,
         Cmd::Tokenize { model, text } => {
             let g = gguf::Gguf::open_shard(&model)?;

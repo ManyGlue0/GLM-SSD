@@ -5,12 +5,9 @@ measurements; this file has *state, gotchas and the exact plan for the next step
 
 ## Current state (2026-11-01)
 
-- M0, M1 done. M2 forward pass + tokenizer written (`crates/engine/src/forward.rs`,
-  `tokenizer.rs`, `kernels/ops.cu`), **not yet run**: waiting for the model download.
-- Download: background `target/release/hfdl.exe -c 16 > download.log` (resumable: rerun
-  `.\download.ps1`; it skips finished files and resumes `.part` files). Each file is SHA-256
-  verified against HF and renamed from `.part` when done. Complete = 4 `.gguf` in
-  `models/UD-IQ2_XXS/` and no `.part` files. Shards 1 and 4 were already complete+verified.
+- M0, M1, M2 done (M2 validated 2026-11-01, see DESIGN.md roadmap). Next: M3.
+- Model: all 4 shards in `models/UD-IQ2_XXS/`, SHA-256 verified against HF (sha256sum -c).
+  (hfdl aborted at 100% on a state-save race, fixed in 20a10ac; the files were already fine.)
 - Reference: llama.cpp master @785322d in `ref/llama.cpp` (gitignored), CUDA build done:
   `ref/llama.cpp/build/bin/Release/llama-eval-callback.exe`. (`llama-cli`/`llama-perplexity`
   targets don't exist in this version: cli became `llama-app`; not needed.)
@@ -22,7 +19,14 @@ measurements; this file has *state, gotchas and the exact plan for the next step
 - Python venv with numpy+pyyaml (for gguf-py): session scratchpad `qenv/` (path in settings rule).
   `tools/qref.py` already verified: CPU dequant == gguf-py bit-exact (15 vector sets).
 
-## M2 validation plan (do this when the download completes)
+## M2 validation recipe (done once; rerun after changing the forward pass)
+
+Results: per-layer sums within 1-3% of llama.cpp; the residual gap is llama.cpp's Q8_1
+activation quantization. Arbiter: `glm-ssd ref-l0 --token 785` (f64 CPU, layer 0) matches our
+GPU trace to 6 digits. Comparison scripts used (session scratchpad, not in repo): parse
+`common_debug_cb_eval: <name> = ... sum = X` from the reference log and `[pos] name sum=` from
+ours; for multi-token prompts compare the LAST printed row of each ref tensor with our last
+position. llama-eval-callback has no `--no-warmup` flag in this version.
 
 1. `glm-ssd inspect --vram-budget 22G --ram-budget 24G` (full open, checks all shards).
 2. Tokenizer check: run llama-eval-callback with a prompt and compare its printed token ids to

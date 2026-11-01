@@ -327,6 +327,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Trace the mHC weights of the last hc_pre (llama.cpp names: hc_mixes, hc_pre, hc_post, hc_comb).
+    fn dbg_hc(&self, il: usize) -> Result<()> {
+        let il = il as isize;
+        self.dbg("hc_mixes", il, self.mixes.f32(), 24)?;
+        let w = self.hcw.f32();
+        self.dbg("hc_pre", il, w, 4)?;
+        self.dbg("hc_post", il, unsafe { w.add(4) }, 4)?;
+        self.dbg("hc_comb", il, unsafe { w.add(8) }, 16)
+    }
+
     /// Embedding row lookup on the CPU (only one row is needed per token).
     fn embed(&self, tok: u32) -> Result<Vec<f32>> {
         let t = &self.tok_embd;
@@ -587,6 +597,7 @@ impl Engine {
             let layer = &self.layers[il];
             // attention block
             self.hc_pre(&layer.hc_attn, self.x.f32())?;
+            self.dbg_hc(il)?;
             self.rms(self.x.f32(), Some(&layer.attn_norm), self.xn.f32(), 1, n)?;
             self.dbg("attn_norm", il as isize, self.xn.f32(), n)?;
             match &layer.attn {
@@ -595,9 +606,12 @@ impl Engine {
             }
             self.dbg("attn_out", il as isize, self.out.f32(), n)?;
             self.hc_post(self.out.f32())?;
+            self.dbg("hc_attn_post", il as isize, self.streams.f32(), self.cfg.hc * n)?;
             // FFN block
             let layer = &self.layers[il];
             self.hc_pre(&layer.hc_ffn, self.x.f32())?;
+            self.dbg_hc(il)?;
+            self.dbg("hc_ffn_pre", il as isize, self.x.f32(), n)?;
             self.rms(self.x.f32(), Some(&layer.ffn_norm), self.xn.f32(), 1, n)?;
             self.dbg("ffn_norm", il as isize, self.xn.f32(), n)?;
             match &layer.ffn {
