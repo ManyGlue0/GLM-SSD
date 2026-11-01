@@ -258,7 +258,7 @@ async fn main() -> Result<()> {
                                 return Err(e.context(format!("giving up on {} chunk {}", c.job.repo_path, c.idx)));
                             }
                             if attempt % 5 == 1 {
-                                pb.println(format!("  retry {attempt} {} #{}: {e:#}", c.job.repo_path, c.idx));
+                                say(&pb, format!("  retry {attempt} {} #{}: {e:#}", c.job.repo_path, c.idx));
                             }
                             let backoff = Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
                             tokio::time::sleep(backoff).await;
@@ -272,7 +272,9 @@ async fn main() -> Result<()> {
                 let left = c.job.remaining.fetch_sub(1, Ordering::SeqCst) - 1;
                 let due = { c.job.last_save.lock().unwrap().elapsed() > Duration::from_secs(3) };
                 if due || left == 0 {
-                    save_state(&c.job)?;
+                    if let Err(e) = save_state(&c.job) {
+                        say(&pb, format!("  warning: saving resume state for {}: {e:#}", c.job.repo_path));
+                    }
                 }
                 if left == 0 {
                     verifiers.lock().unwrap().push(spawn_finish(c.job.clone(), verify, pb.clone()));
@@ -294,12 +296,12 @@ async fn main() -> Result<()> {
         pb.abandon();
         return Err(e.context("download incomplete - rerun the same command to resume"));
     }
-    pb.println("all chunks downloaded, waiting for verification...");
+    say(&pb, "all chunks downloaded, waiting for verification...");
     let handles: Vec<_> = std::mem::take(&mut *verifiers.lock().unwrap());
     let mut failed = false;
     for h in handles {
         if let Err(e) = h.await? {
-            pb.println(format!("  ERROR: {e:#}"));
+            say(&pb, format!("  ERROR: {e:#}"));
             failed = true;
         }
     }
@@ -323,14 +325,32 @@ fn with_suffix(p: &Path, s: &str) -> PathBuf {
 }
 
 fn save_state(job: &FileJob) -> Result<()> {
-    let json = { serde_json::to_vec(&*job.state.lock().unwrap())? };
+    // Hold the state lock for the whole write+rename: workers save concurrently and share one
+    // tmp path, so an unserialized second rename would fail with "file not found".
+    let st = job.state.lock().unwrap();
+    if !job.part_path.exists() {
+        // Already verified and renamed (or moved to .corrupt): no state to keep.
+        let _ = std::fs::remove_file(&job.state_path);
+        return Ok(());
+    }
+    let json = serde_json::to_vec(&*st)?;
     // Persist data before claiming chunks are done.
     job.file.sync_data().ok();
     let tmp = with_suffix(&job.state_path, ".tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &job.state_path)?;
+    drop(st);
     *job.last_save.lock().unwrap() = Instant::now();
     Ok(())
+}
+
+/// `ProgressBar::println` prints nothing when the bar is hidden (output redirected to a log).
+fn say(pb: &ProgressBar, msg: impl AsRef<str>) {
+    if pb.is_hidden() {
+        println!("{}", msg.as_ref());
+    } else {
+        pb.println(msg);
+    }
 }
 
 async fn list_tree(api: &reqwest::Client, repo: &str, rev: &str, token: Option<&str>) -> Result<Vec<TreeEntry>> {
@@ -491,11 +511,11 @@ fn spawn_finish(job: Arc<FileJob>, verify: bool, pb: ProgressBar) -> tokio::task
                     let _ = std::fs::remove_file(&job.state_path);
                     bail!("SHA-256 mismatch for {} (got {got}, want {expected})", job.repo_path);
                 }
-                pb.println(format!("  verified {} ({:.0}s)", job.repo_path, t.elapsed().as_secs_f64()));
+                say(&pb, format!("  verified {} ({:.0}s)", job.repo_path, t.elapsed().as_secs_f64()));
             }
         }
         rename_when_free(&job)?;
-        pb.println(format!("  done {}", job.repo_path));
+        say(&pb, format!("  done {}", job.repo_path));
         Ok(())
     })
 }
