@@ -30,8 +30,14 @@ What is the capital of France?<|assistant|>
 ### Known limits / ideas
 - Decode is SSD-bound (~0.8 GB misses/token at ~6 GB/s). Options: bigger budgets; per-expert
   contiguous repack (+~15% read throughput); CPU compute for RAM-resident experts (avoids PCIe).
-- Prefill compute is ~half the time at chunk 2048 (I/O the other half): GEMM tiles are 64x64 and
-  MoE groups are small (~57 tokens/expert); a split-K or larger-N kernel would help.
+- Prefill (layer-major sweep) is SSD-bound for prompts up to a few K tokens: ~70 GB of uncached
+  experts per pass. Ideas: prefetch the next layer's hot experts during the current layer's
+  MoE; per-expert contiguous repack. Prompts <= one chunk (512) don't use the sweep (no gain).
+- TTFT probe used for the prefill / prompt-cache work: a stdlib Python client streaming
+  /v1/chat/completions (fresh prompts of 66-3.5K tokens; 4-turn chats with the client keeping vs
+  dropping `reasoning_content`), reading TTFT and the server's per-request `prompt N tok (M cached)`.
+- Sweep vs chunked logits differ by f16-GEMM rounding noise (same size as --chunk 512 vs 2048,
+  and run-to-run variation from expert arrival order); greedy continuations match.
 - Speculative prefetch with larger K hurts (wrong guesses steal SSD bandwidth); K=2 is neutral-positive.
 - Server handles one request at a time (single sequence engine).
 - Expert cache tiers can't hand experts down VRAM -> RAM (single copy engine on this GPU/driver).
@@ -101,5 +107,9 @@ position. llama-eval-callback has no `--no-warmup` flag in this version.
 - MTP: `mtp_pos` is the next MTP position; exactly one "pending" row (hidden of the last trunk
   position, waiting for its next token) exists after a prefill or a finished generation.
 - Snapshots are invalidated when a request diverges before them (positions get overwritten).
+  One is taken at the end of EVERY prompt: without it a client that changes the last answer
+  (stripped reasoning, whitespace) forced a re-read of the whole conversation (28 s at 835 tokens).
+- Saved session (idle unload) = snapshot at pos + MLA latents/scales/pooled keys up to
+  max(pos, mtp_pos) + Session history/logits/snapshots; only valid for the same engine options.
 - Expert slot reuse is guarded by events: RAM slot -> its last H2D; VRAM slot -> its last use.
 - Each MoE size class (7.19 / 8.38 / 8.69 / 9.38 MiB) has its own slot pools (>= 24 slots each).

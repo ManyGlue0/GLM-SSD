@@ -8,8 +8,9 @@ use crate::session::{GenStats, Sampler, SamplerCfg};
 use crate::tokenizer::Vocab;
 use anyhow::{Context, Result};
 use serde_json::{json, Value as Json};
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Server {
@@ -22,6 +23,90 @@ pub struct Server {
     pub sampler: SamplerCfg,
     /// context window in tokens (--ctx): prompt + answer
     pub ctx: usize,
+    /// reasoning of recent answers, put back when a client returns them without it (None = off)
+    pub replay: Option<Mutex<Replay>>,
+}
+
+/// Reasoning of our recent answers, keyed by what the client sees of them (content + tool calls).
+///
+/// OpenAI-style clients drop `reasoning_content` when they send the conversation back. The chat
+/// template would then render that answer as `<think></think>content`, which no longer matches
+/// the tokens the engine processed: the prompt cache has to rewind to before the answer and
+/// re-read it (an SSD sweep, 10+ s). Putting the reasoning back keeps the conversation
+/// token-identical, and is also what the model expects (the template keeps past reasoning).
+#[derive(Default)]
+pub struct Replay {
+    map: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+const REPLAY_MAX: usize = 1024;
+
+impl Replay {
+    fn put(&mut self, key: String, reasoning: &str) {
+        if key.is_empty() || reasoning.trim().is_empty() {
+            return;
+        }
+        if self.map.insert(key.clone(), reasoning.to_string()).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > REPLAY_MAX {
+                if let Some(k) = self.order.pop_front() {
+                    self.map.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// Copy of `msgs` with the reasoning of known answers filled in; also the number filled.
+    fn fill(&self, msgs: &Json) -> (Json, usize) {
+        let mut out = msgs.clone();
+        let mut n = 0;
+        for m in out.as_array_mut().into_iter().flatten() {
+            if m["role"] != "assistant" || m["reasoning_content"].as_str().is_some_and(|r| !r.is_empty()) {
+                continue;
+            }
+            let content = message_text(&m["content"]);
+            if content.contains("</think>") {
+                continue;
+            }
+            let calls: Vec<(String, Json)> = m["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tc| {
+                    let f = if tc.get("function").is_some() { &tc["function"] } else { tc };
+                    let args = match &f["arguments"] {
+                        Json::String(s) => serde_json::from_str(s).unwrap_or_else(|_| Json::String(s.clone())),
+                        v => v.clone(),
+                    };
+                    (f["name"].as_str().unwrap_or("").to_string(), args)
+                })
+                .collect();
+            if let Some(r) = self.map.get(&answer_key(&content, &calls)) {
+                m["reasoning_content"] = json!(r);
+                n += 1;
+            }
+        }
+        (out, n)
+    }
+}
+
+/// Text of a message `content`: a string, or the text parts of an array.
+fn message_text(c: &Json) -> String {
+    match c {
+        Json::String(s) => s.clone(),
+        Json::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+fn answer_key(content: &str, calls: &[(String, Json)]) -> String {
+    let content = content.trim();
+    if content.is_empty() && calls.is_empty() {
+        return String::new();
+    }
+    let calls: Vec<String> = calls.iter().map(|(n, a)| format!("{n}\u{2}{a}")).collect();
+    format!("{content}\u{1}{}", calls.join("\u{3}"))
 }
 
 impl Server {
@@ -180,7 +265,14 @@ fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Resu
                 }
             },
         };
-        match s.tmpl.render(msgs, j.get("tools"), effort, true) {
+        let (msgs, replayed) = match &s.replay {
+            Some(r) => r.lock().unwrap_or_else(|e| e.into_inner()).fill(msgs),
+            None => (msgs.clone(), 0),
+        };
+        if replayed > 0 {
+            eprintln!("(reasoning of {replayed} earlier answer(s) put back into the conversation)");
+        }
+        match s.tmpl.render(&msgs, j.get("tools"), effort, true) {
             Ok(p) => p,
             Err(e) => return error(req, 400, &format!("chat template: {e:#}")),
         }
@@ -299,6 +391,14 @@ fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Resu
         }
     }
     let (reasoning, content, calls) = if chat { parse_output(&text, in_think) } else { (String::new(), text.clone(), vec![]) };
+    if let (true, Some(r)) = (chat, &s.replay) {
+        let kc: Vec<(String, Json)> = calls.iter().map(|c| (c.name.clone(), c.arguments.clone())).collect();
+        let mut r = r.lock().unwrap_or_else(|e| e.into_inner());
+        r.put(answer_key(&content, &kc), &reasoning);
+        if sse.is_some() && content_sent.trim() != content.trim() {
+            r.put(answer_key(&content_sent, &kc), &reasoning); // what a streaming client assembled
+        }
+    }
     let finish = if !calls.is_empty() {
         "tool_calls"
     } else if hit_eos || stopped {

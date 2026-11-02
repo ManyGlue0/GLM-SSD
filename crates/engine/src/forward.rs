@@ -8,6 +8,8 @@
 //!   -> mHC post -> mHC pre -> RMSNorm -> dense FFN | MoE (shared expert + top-8 routed) -> mHC post
 //!
 //! Small batches (T <= 8) use the quantized GEMV kernels, larger ones the tensor-core GEMM.
+//! Long prefills run layer-major (`forward_sweep`): every layer over all chunks of up to
+//! `--prefill-batch` tokens, so each layer's experts are read from the SSD once per pass.
 
 use crate::config::{AttnKind, Config};
 use crate::experts::{CacheConfig, ExpertCache, ExpertPtrs};
@@ -16,7 +18,31 @@ use anyhow::{bail, Context, Result};
 use cuda::{bytes_of, bytes_of_mut, check, ffi, ops, DeviceBuffer, Stream};
 use gguf::{Gguf, TensorInfo};
 use std::fs::File;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
+
+// ---- little binary format for saved sessions --------------------------------------------------------
+pub fn put_u64(w: &mut impl Write, v: u64) -> Result<()> {
+    w.write_all(&v.to_le_bytes())?;
+    Ok(())
+}
+pub fn put_bytes(w: &mut impl Write, b: &[u8]) -> Result<()> {
+    put_u64(w, b.len() as u64)?;
+    w.write_all(b)?;
+    Ok(())
+}
+pub fn get_u64(r: &mut impl Read) -> Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+pub fn get_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
+    let n = get_u64(r)? as usize;
+    anyhow::ensure!(n <= 1 << 36, "corrupt session file");
+    let mut v = vec![0u8; n];
+    r.read_exact(&mut v)?;
+    Ok(v)
+}
 
 macro_rules! ck {
     ($e:expr) => {
@@ -126,8 +152,29 @@ pub struct EngineOpts {
     /// decode: swap an expert that would need an SSD read for a cached one whose routing
     /// score is within this margin (0 = exact routing)
     pub cache_aware: f32,
+    /// prefill: tokens per layer-major pass over the model (0 or <= chunk = chunk by chunk)
+    pub sweep: usize,
     pub cache: CacheConfig,
 }
+
+/// Device buffers of a layer-major prefill pass over up to `cap` tokens.
+struct Sweep {
+    cap: usize,
+    /// residual streams [cap][hc][n]
+    streams: DeviceBuffer,
+    /// FFN input (normed) [cap][n]
+    xn: DeviceBuffer,
+    /// FFN output: shared expert + routed experts [cap][n]
+    out: DeviceBuffer,
+    /// mHC post weights of the FFN sub-block [cap][24]
+    hcw: DeviceBuffer,
+    /// token rows / weights grouped by expert [cap * n_expert_used]
+    idx: DeviceBuffer,
+    w: DeviceBuffer,
+}
+
+/// Floats per token of the mHC mixing weights (`hcw` scratch rows).
+const HCW: usize = 24;
 
 /// Host copy of the sequence-dependent state that cannot be recomputed from the caches
 /// (prefix caching): KDA states + conv states + indexer rings, at position `pos`.
@@ -140,6 +187,21 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn bytes(&self) -> usize {
         self.data.iter().map(Vec::len).sum()
+    }
+    pub fn write_to(&self, w: &mut impl Write) -> Result<()> {
+        for v in [self.pos, self.mtp_pos, self.pend_n, self.data.len()] {
+            put_u64(w, v as u64)?;
+        }
+        for d in &self.data {
+            put_bytes(w, d)?;
+        }
+        Ok(())
+    }
+    pub fn read_from(r: &mut impl Read) -> Result<Self> {
+        let (pos, mtp_pos, pend_n, n) = (get_u64(r)? as usize, get_u64(r)? as usize, get_u64(r)? as usize, get_u64(r)? as usize);
+        anyhow::ensure!(n < 1 << 16, "corrupt session file");
+        let data = (0..n).map(|_| get_bytes(r)).collect::<Result<_>>()?;
+        Ok(Self { pos, mtp_pos, pend_n, data })
     }
 }
 
@@ -205,6 +267,7 @@ pub struct Engine {
     pend_n: usize,
     hall: DeviceBuffer, // all rows' hidden during MTP-fed prefill [chunk][n_embd]
     sel_stride: usize,
+    sweep: Option<Sweep>,
 }
 
 fn fbuf(n: usize, s: &Stream) -> Result<DeviceBuffer> {
@@ -377,8 +440,8 @@ impl Engine {
             s1: fbuf(t * 2048, &s)?,
             s2: fbuf(t * 2048, &s)?,
             s3: fbuf(t * 2048, &s)?,
-            mixes: fbuf(t * 24, &s)?,
-            hcw: fbuf(t * 24, &s)?,
+            mixes: fbuf(t * HCW, &s)?,
+            hcw: fbuf(t * HCW, &s)?,
             qabs: fbuf(tq * hr, &s)?,
             olat: fbuf(tq * hr, &s)?,
             part: fbuf(128 * (16 * cfg.kv_lora_rank + 32), &s)?,
@@ -399,6 +462,22 @@ impl Engine {
             pend_n: 0,
             hall: fbuf(if with_mtp { (t + 1) * n } else { 1 }, &s)?,
             sel_stride,
+            sweep: {
+                let cap = (o.sweep / chunk) * chunk;
+                if cap > chunk {
+                    Some(Sweep {
+                        cap,
+                        streams: DeviceBuffer::new(cap * cfg.hc * n * 4).context("prefill sweep buffers")?,
+                        xn: DeviceBuffer::new(cap * n * 4)?,
+                        out: DeviceBuffer::new(cap * n * 4)?,
+                        hcw: DeviceBuffer::new(cap * HCW * 4)?,
+                        idx: DeviceBuffer::new(cap * cfg.n_expert_used * 4)?,
+                        w: DeviceBuffer::new(cap * cfg.n_expert_used * 4)?,
+                    })
+                } else {
+                    None
+                }
+            },
             tok_embd,
             files,
             _w: w,
@@ -502,6 +581,51 @@ impl Engine {
         self.mtp_pos = snap.mtp_pos;
         self.pend_n = snap.pend_n;
         Ok(())
+    }
+
+    /// Buffers holding per-position attention caches, with the bytes of one position (or pool) and
+    /// the number of positions in use; the rest of the sequence state is in `snapshot`.
+    fn position_caches(&self) -> Vec<(&DeviceBuffer, usize, usize)> {
+        let upto = self.pos.max(self.mtp_pos).min(self.ctx);
+        let pools = (upto / self.cfg.idx_kpool + 1).min(self.ctx / self.cfg.idx_kpool + 1);
+        let mut v = Vec::new();
+        for st in &self.states {
+            if let LayerState::Mla { latent, scales, pooled, .. } = st {
+                v.push((latent, latent.len() / self.ctx, upto));
+                if let Some(sc) = scales {
+                    v.push((sc, sc.len() / self.ctx, upto));
+                }
+                v.push((pooled, pooled.len() / (self.ctx / self.cfg.idx_kpool + 1), pools));
+            }
+        }
+        v
+    }
+
+    /// Write the whole sequence state (attention caches up to the current position + recurrent
+    /// state) so that `load_state` in a new engine with the same options continues it exactly.
+    pub fn save_state(&self, w: &mut impl Write) -> Result<()> {
+        self.snapshot()?.write_to(w)?;
+        for (b, unit, n) in self.position_caches() {
+            let mut v = vec![0u8; unit * n];
+            b.download(0, &mut v, &self.s)?;
+            self.s.sync()?;
+            put_bytes(w, &v)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_state(&mut self, r: &mut impl Read) -> Result<()> {
+        let snap = Snapshot::read_from(r)?;
+        anyhow::ensure!(snap.pos <= self.ctx && snap.mtp_pos <= self.ctx, "saved session does not fit --ctx");
+        // position_caches() sizes from pos/mtp_pos: set them first
+        self.pos = snap.pos;
+        self.mtp_pos = snap.mtp_pos;
+        for (b, unit, n) in self.position_caches() {
+            let v = get_bytes(r)?;
+            anyhow::ensure!(v.len() == unit * n, "saved session has another layout");
+            b.upload(0, &v, &self.s)?;
+        }
+        self.restore(&snap)
     }
 
     // ---- helpers ------------------------------------------------------------------------------------
@@ -901,6 +1025,19 @@ impl Engine {
         if toks.is_empty() {
             return Ok(Vec::new());
         }
+        let cap = self.sweep.as_ref().map_or(0, |s| s.cap);
+        if toks.len() > self.chunk && cap > 0 && !save_first && rows != Rows::All && !self.trace {
+            // layer-major passes of up to `cap` tokens
+            let n_sp = toks.len().div_ceil(cap);
+            let mut out = Vec::new();
+            for (si, sp) in toks.chunks(cap).enumerate() {
+                let last = si + 1 == n_sp;
+                let next = if last { None } else { Some(toks[(si + 1) * cap]) };
+                let r = if last { rows } else { Rows::None };
+                out = if sp.len() > self.chunk { self.forward_sweep(sp, r, next)? } else { self.forward_chunk(sp, r, false, next)? };
+            }
+            return Ok(out);
+        }
         let n_chunks = toks.len().div_ceil(self.chunk);
         let mut out = Vec::new();
         for (ci, ch) in toks.chunks(self.chunk).enumerate() {
@@ -956,7 +1093,181 @@ impl Engine {
         }
         self.pos += t;
         self.experts.tick(t as u64);
+        let result = self.finish_chunk(toks, rows, next)?;
+        self.s.sync()?;
+        self.timings.tokens += t;
+        self.timings.total += t0.elapsed();
+        Ok(result)
+    }
 
+    /// Tokens per prefill step: one layer-major sweep, or one chunk without sweeps.
+    pub fn prefill_step(&self) -> usize {
+        self.sweep.as_ref().map_or(self.chunk, |s| s.cap)
+    }
+
+    /// Layer-major prefill of `toks` (more than one chunk, at most the sweep capacity): each layer
+    /// runs over every chunk before the next layer starts, and its routed experts run once over
+    /// all the tokens routed to them. Each layer's experts are read from the SSD once for the
+    /// whole span instead of once per chunk (a 512-token chunk touches nearly all 288).
+    fn forward_sweep(&mut self, toks: &[u32], rows: Rows, next: Option<u32>) -> Result<Vec<Vec<f32>>> {
+        let t_start = Instant::now();
+        let len = toks.len();
+        let (n, ne, ch) = (self.cfg.n_embd, self.cfg.n_expert, self.chunk);
+        let hcn = self.cfg.hc * n;
+        if self.pos + len > self.ctx {
+            bail!("context full: {} + {len} tokens > --ctx {}", self.pos, self.ctx);
+        }
+        let sw = self.sweep.as_ref().context("no sweep buffers")?;
+        anyhow::ensure!(len <= sw.cap, "sweep span too long");
+        let (bs, bxn, bout, bhcw) = (sw.streams.f32(), sw.xn.f32(), sw.out.f32(), sw.hcw.f32());
+        let (bidx, bw) = (sw.idx.ptr() as *mut i32, sw.w.f32());
+        let base = self.pos;
+        let spans: Vec<(usize, usize)> = (0..len).step_by(ch).map(|o| (o, ch.min(len - o))).collect();
+        let streams = self.streams.f32();
+        // copies between the per-chunk scratch and the sweep buffers (same stream, in order)
+        let cp = |s: &Stream, dst: *mut f32, src: *const f32, floats: usize| -> Result<()> { unsafe { s.d2d(dst as _, src as _, floats * 4) } };
+
+        for &(o, t) in &spans {
+            self.embed(&toks[o..o + t], self.x.f32())?;
+            ck!(ffi::gs_hc_expand(self.x.f32(), streams, t as i32, n as i32, self.s.raw()));
+            cp(&self.s, bs.wrapping_add(o * hcn), streams, t * hcn)?;
+        }
+
+        for il in 0..self.cfg.n_layer {
+            let layer: &Layer = unsafe { &*(&self.layers[il] as *const Layer) }; // layers are never mutated
+            let (hca, hcf) = layer.hc.as_ref().unwrap();
+            let is_moe = matches!(layer.ffn, Ffn::Moe { .. });
+            let mut routes: Vec<Vec<(u16, f32)>> = Vec::with_capacity(if is_moe { len } else { 0 });
+            let mut seen = vec![false; ne];
+            // pass 1, chunk by chunk: attention, then the FFN input (dense FFN done here)
+            for &(o, t) in &spans {
+                self.p0 = base + o;
+                cp(&self.s, streams, bs.wrapping_add(o * hcn), t * hcn)?;
+                self.hc_pre(hca, t)?;
+                self.rms(self.x.f32(), Some(&layer.attn_norm), self.xn.f32(), t, n)?;
+                match &layer.attn {
+                    Attn::Kda(w) => self.kda(il, w, t, false)?,
+                    Attn::Mla(w) => self.mla(il, w, t)?,
+                }
+                self.hc_post(t)?;
+                self.hc_pre(hcf, t)?;
+                self.rms(self.x.f32(), Some(&layer.ffn_norm), self.xn.f32(), t, n)?;
+                match &layer.ffn {
+                    Ffn::Dense { gate, up, down } => {
+                        self.swiglu_ffn(gate, up, down, self.xn.f32(), self.out.f32(), layer.clamp_shexp, t)?;
+                        self.hc_post(t)?;
+                    }
+                    Ffn::Moe { router, bias, sh_gate, sh_up, sh_down } => {
+                        // shared expert straight into the span's FFN output
+                        self.swiglu_ffn(sh_gate, sh_up, sh_down, self.xn.f32(), bout.wrapping_add(o * n), layer.clamp_shexp, t)?;
+                        cp(&self.s, bxn.wrapping_add(o * n), self.xn.f32(), t * n)?;
+                        cp(&self.s, bhcw.wrapping_add(o * HCW), self.hcw.f32(), t * HCW)?;
+                        self.mm(router, self.xn.f32(), self.router.f32(), t)?;
+                        let mut logits = vec![0f32; t * ne];
+                        self.router.download(0, bytes_of_mut(&mut logits), &self.s)?;
+                        self.s.sync()?;
+                        let r = self.route_cached(il, bias, &logits, t);
+                        // start reading this chunk's experts while the next chunks' attention runs
+                        let mut fresh = Vec::new();
+                        for &(e, _) in r.iter().flatten() {
+                            if !std::mem::replace(&mut seen[e as usize], true) {
+                                fresh.push(e);
+                            }
+                        }
+                        self.experts.prefetch(il, &fresh);
+                        routes.extend(r);
+                    }
+                }
+                cp(&self.s, bs.wrapping_add(o * hcn), streams, t * hcn)?;
+            }
+            if !is_moe {
+                continue;
+            }
+            // pass 2: routed experts, each over all its tokens of the span
+            let t_moe = Instant::now();
+            let mut groups: Vec<Vec<(i32, f32)>> = vec![Vec::new(); ne];
+            for (ti, r) in routes.iter().enumerate() {
+                for &(e, w) in r {
+                    groups[e as usize].push((ti as i32, w));
+                }
+            }
+            let used: Vec<u16> = (0..ne as u16).filter(|e| !groups[*e as usize].is_empty()).collect();
+            let mut offs = vec![0usize; ne];
+            let mut flat_idx = Vec::with_capacity(len * self.cfg.n_expert_used);
+            let mut flat_w = Vec::with_capacity(len * self.cfg.n_expert_used);
+            for &e in &used {
+                offs[e as usize] = flat_idx.len();
+                for &(ti, w) in &groups[e as usize] {
+                    flat_idx.push(ti);
+                    flat_w.push(w);
+                }
+            }
+            let sw = self.sweep.as_ref().unwrap();
+            sw.idx.upload(0, bytes_of(&flat_idx), &self.s)?;
+            sw.w.upload(0, bytes_of(&flat_w), &self.s)?;
+            let mut fetch = self.experts.fetch_layer(il, &used)?;
+            let lim = layer.clamp_exp;
+            let parts = self.exp_dims[il].context("no expert tensors")?;
+            while let Some((e, p)) = self.experts.next(&mut fetch, &self.copy, &self.s)? {
+                let (off, m) = (offs[e as usize], groups[e as usize].len());
+                for sub in (0..m).step_by(ch) {
+                    let k = ch.min(m - sub);
+                    self.run_expert_rows(&parts, p, bxn, bout, bidx.wrapping_add(off + sub), bw.wrapping_add(off + sub), k, lim)?;
+                }
+                self.experts.done_with(il, e, &self.s)?;
+            }
+            // residual: streams += mHC post of the FFN output
+            for &(o, t) in &spans {
+                cp(&self.s, streams, bs.wrapping_add(o * hcn), t * hcn)?;
+                cp(&self.s, self.out.f32(), bout.wrapping_add(o * n), t * n)?;
+                cp(&self.s, self.hcw.f32(), bhcw.wrapping_add(o * HCW), t * HCW)?;
+                self.hc_post(t)?;
+                cp(&self.s, bs.wrapping_add(o * hcn), streams, t * hcn)?;
+            }
+            self.timings.moe += t_moe.elapsed();
+        }
+        self.pos += len;
+        self.experts.tick(len as u64);
+
+        // logits / MTP feeding chunk by chunk, in position order
+        let mut result = Vec::new();
+        for (ci, &(o, t)) in spans.iter().enumerate() {
+            let last = ci + 1 == spans.len();
+            self.p0 = base + o;
+            cp(&self.s, streams, bs.wrapping_add(o * hcn), t * hcn)?;
+            let nx = if last { next } else { Some(toks[o + t]) };
+            result = self.finish_chunk(&toks[o..o + t], if last { rows } else { Rows::None }, nx)?;
+        }
+        self.s.sync()?;
+        self.timings.tokens += len;
+        self.timings.total += t_start.elapsed();
+        Ok(result)
+    }
+
+    /// One routed expert over `m` (<= chunk) token rows of the sweep: gather from `xn`,
+    /// SwiGLU, scatter-add (weighted) into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_expert_rows(
+        &self, dims: &[DTensor; 3], p: ExpertPtrs, xn: *const f32, out: *mut f32, idx: *const i32, w: *const f32, m: usize, lim: f32,
+    ) -> Result<()> {
+        let n = self.cfg.n_embd;
+        let mk = |i: usize, ptr: *const u8| DTensor { ptr: ptr as _, ..dims[i] };
+        let (wg, wu, wd) = (mk(0, p.gate), mk(1, p.up), mk(2, p.down));
+        let (eg, eu) = (self.eg.f32(), self.eu.f32());
+        ck!(ffi::gs_gather_rows(xn, idx, self.xg.f32(), m as i32, n as i32, self.s.raw()));
+        self.mm(&wg, self.xg.f32(), eg, m)?;
+        self.mm(&wu, self.xg.f32(), eu, m)?;
+        ck!(ffi::gs_swiglu(eg, eu, eg, (m * wg.d1) as i64, lim, self.s.raw()));
+        self.mm(&wd, eg, self.ey.f32(), m)?;
+        ck!(ffi::gs_scatter_add_rows(out, idx, w, self.ey.f32(), m as i32, n as i32, self.s.raw()));
+        Ok(())
+    }
+
+    /// After the trunk ran over `toks` (their final streams in `streams`): logits of the requested
+    /// rows, and the MTP head fed with the chunk.
+    fn finish_chunk(&mut self, toks: &[u32], rows: Rows, next: Option<u32>) -> Result<Vec<Vec<f32>>> {
+        let t = toks.len();
+        let n = self.cfg.n_embd;
         // normed final hidden of every row the caller or the MTP head needs
         let mtp_feed = self.mtp.is_some() && rows != Rows::All;
         let (r0, nr) = match rows {
@@ -993,9 +1304,6 @@ impl Engine {
         if mtp_feed {
             self.mtp_feed_chunk(toks, next)?;
         }
-        self.s.sync()?;
-        self.timings.tokens += t;
-        self.timings.total += t0.elapsed();
         Ok(result)
     }
 

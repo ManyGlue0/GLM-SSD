@@ -8,7 +8,10 @@
 
 use crate::forward::{Engine, Rows, Snapshot};
 use anyhow::Result;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
+
+const SESSION_MAGIC: &[u8; 16] = b"GLMSSD-SESSION-1";
 
 #[derive(Clone, Debug)]
 pub struct SamplerCfg {
@@ -142,6 +145,57 @@ impl Session {
         &self.history
     }
 
+    /// Write the conversation state (tokens, attention caches, prompt-cache snapshots) to `path`,
+    /// so a later engine with the same options can continue it without re-reading the prompt.
+    pub fn save_to(&self, path: &std::path::Path) -> Result<u64> {
+        use crate::forward::{put_bytes, put_u64};
+        let f = std::fs::File::create(path)?;
+        let mut w = std::io::BufWriter::with_capacity(8 << 20, f);
+        w.write_all(SESSION_MAGIC)?;
+        put_bytes(&mut w, cuda::bytes_of(&self.history))?;
+        put_bytes(&mut w, self.last_logits.as_deref().map_or(&[][..], cuda::bytes_of))?;
+        put_u64(&mut w, self.snaps.len() as u64)?;
+        for s in &self.snaps {
+            s.write_to(&mut w)?;
+        }
+        self.eng.save_state(&mut w)?;
+        w.flush()?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// Continue the conversation saved by `save_to`. On error the session is reset (empty).
+    pub fn load_from(&mut self, path: &std::path::Path) -> Result<()> {
+        let res = self.load_inner(path);
+        if res.is_err() {
+            self.history.clear();
+            self.last_logits = None;
+            self.snaps.clear();
+            self.eng.reset()?;
+        }
+        res
+    }
+
+    fn load_inner(&mut self, path: &std::path::Path) -> Result<()> {
+        use crate::forward::{get_bytes, get_u64};
+        let f = std::fs::File::open(path)?;
+        let mut r = std::io::BufReader::with_capacity(8 << 20, f);
+        let mut magic = [0u8; SESSION_MAGIC.len()];
+        r.read_exact(&mut magic)?;
+        anyhow::ensure!(&magic == SESSION_MAGIC, "not a glm-ssd session file");
+        let words = |b: Vec<u8>| -> Vec<u32> { b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() };
+        let history = words(get_bytes(&mut r)?);
+        let logits: Vec<f32> = words(get_bytes(&mut r)?).into_iter().map(f32::from_bits).collect();
+        let n = get_u64(&mut r)? as usize;
+        anyhow::ensure!(n <= 4096, "corrupt session file");
+        let snaps = (0..n).map(|_| Snapshot::read_from(&mut r)).collect::<Result<Vec<_>>>()?;
+        self.eng.load_state(&mut r)?;
+        anyhow::ensure!(self.eng.pos == history.len(), "saved session is inconsistent");
+        self.history = history;
+        self.last_logits = (!logits.is_empty()).then_some(logits);
+        self.snaps = snaps;
+        Ok(())
+    }
+
     fn take_snapshot(&mut self) -> Result<()> {
         if self.max_snaps == 0 || self.snaps.iter().any(|s| s.pos == self.eng.pos) {
             return Ok(());
@@ -194,8 +248,8 @@ impl Session {
             let end = (done + self.snap_every).min(prompt.len());
             let seg = &prompt[done..end];
             let rows = if end == prompt.len() { Rows::Last } else { Rows::None };
-            // prefill in engine-sized chunks so progress can be reported
-            let chunk = self.eng.chunk;
+            // prefill in engine-sized steps (one model sweep each) so progress can be reported
+            let chunk = self.eng.prefill_step();
             let mut i = 0;
             while i < seg.len() {
                 let j = (i + chunk).min(seg.len());
@@ -209,9 +263,10 @@ impl Session {
                 progress(done + i, prompt.len());
             }
             done = end;
-            if done < prompt.len() || prompt.len() - start >= 64 {
-                self.take_snapshot()?;
-            }
+            // every prompt end is a turn boundary: the next request of the conversation can rewind
+            // here when it does not continue our exact tokens (e.g. the client dropped the
+            // reasoning of the answer), instead of re-reading the whole conversation
+            self.take_snapshot()?;
         }
         stats.prefill_time = t0.elapsed();
         self.last_logits = Some(logits.clone());

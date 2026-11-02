@@ -120,15 +120,22 @@ much of the remaining SSD traffic can be hidden behind compute.
    detokenizer that splits reasoning / content / tool calls, sampler (temp, top-k/p, min-p).
 6. **M5** batched prefill ✅: the forward pass runs T tokens per call; T > 8 uses a tensor-core
    GEMM that dequantizes weight tiles on the fly (WMMA f16, f32 accumulation; checked against
-   the CPU reference for every quant type in `qtest`). MoE groups tokens per expert, so each
-   expert is read once per chunk. CUDA graphs were dropped: decode syncs with the host at every
+   the CPU reference for every quant type in `qtest`). MoE groups tokens per expert. Prompts
+   longer than a chunk run layer-major (`forward_sweep`, `--prefill-batch` tokens per pass):
+   each layer runs attention chunk by chunk, then every routed expert once over all its tokens
+   of the pass (reads of a chunk's experts start while later chunks' attention runs), so the
+   uncached experts are read once per pass instead of once per 512-token chunk. CUDA graphs were dropped: decode syncs with the host at every
    MoE layer to route (the host must issue the SSD reads), and launch overhead is ~3% of a token.
 7. **M6** OpenAI-compatible server ✅ (`serve`): /v1/chat/completions (SSE streaming with
    `reasoning_content` deltas, tools <-> GLM `<tool_call>` XML), /v1/completions, /v1/models.
 8. **M7** prefix caching ✅ (`session.rs`): attention caches are position-indexed, so a shared
    prefix is reused as-is; KDA/conv states + indexer rings + the MTP pending row are snapshotted
-   (~150 MB, host RAM) at the end of every prompt and every 8K prefill tokens; a request restores
-   the newest snapshot at or before its divergence point.
+   (~150 MB, host RAM) at the end of every prompt (every turn boundary, however short) and every
+   8K prefill tokens; a request restores the newest snapshot at or before its divergence point.
+   The server puts back the reasoning of earlier answers that clients strip from the history
+   (keyed by content + tool calls), so a multi-turn conversation stays token-identical to what was
+   processed. On idle unload the whole state (tokens, latent caches, snapshots) is parked in a
+   temp file and restored on reload.
 9. **M8** MTP speculative decoding ✅ (`--mtp`): the NextN layer drafts 1 token, the trunk verifies
    [cur, draft] in one T=2 pass; on rejection the KDA/conv states saved after the first token are
    restored. The MTP layer's attention cache is fed during prefill too. Exact for any sampler
@@ -146,7 +153,8 @@ much of the remaining SSD traffic can be hidden behind compute.
 | | |
 |---|---|
 | decode, steady state | 5.6 tok/s (5.9 with `--mtp`, 81% accepted on prose, 98% on lists) |
-| prefill | 58 tok/s (chunk 1024, 3.5K prompt), 122 tok/s (chunk 2048, 17K prompt) |
+| prefill, fresh prompt (server, warm) | 66 tok: 11.7 s · 2.3K tok: 23.4 s · 3.5K tok: 27.8 s (126 tok/s); was 83.5 / 119.8 s chunk by chunk |
+| time to first token, chat follow-up | 2-3.5 s (only the new message is processed, also when the client strips reasoning) |
 | long context | needles retrieved at 3.5K and 17K tokens (sparse DSA path), ctx 131072 |
 | expert hit rate (decode) | ~60% VRAM + ~14% RAM, rest from SSD at ~6 GB/s |
 
@@ -168,7 +176,8 @@ Eviction half-life (GLMSSD_DECAY 0.99 / 0.998 / 0.9995) does not change the hit 
 Context memory: 12.7 KB/token with f16 latents (13.8 with MTP) -> 1.7-1.8 GB at 128K; Q8 saves 47%.
 
 Decode is SSD-bandwidth bound (~0.8 GB of expert misses per token); more cache budget is the
-main lever. Prefill streams nearly every expert once per chunk, so bigger chunks are faster.
+main lever. Prefill streams nearly every uncached expert once per pass (~70 GB, ~11 s), so a
+fresh prompt costs ~10-15 s plus compute whatever its length up to `--prefill-batch`.
 
 ## References (read-only, in `ref/`, not part of the build)
 

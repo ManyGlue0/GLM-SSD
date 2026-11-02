@@ -54,14 +54,16 @@ Useful options:
 | flag | meaning |
 |---|---|
 | `--ctx N` | max context (default 32768; 131072 fits on 24 GB) |
-| `--chunk N` | prefill tokens per batched pass (default 512; 2048 roughly doubles prefill speed, costs ~1 GB VRAM) |
+| `--chunk N` | prefill tokens per batched step (default 512) |
+| `--prefill-batch N` | prefill tokens per pass over the model (default 8192, ~0.8 GB VRAM; 0 = off). Each layer runs over all of them before the next, so the experts not in cache are read from the SSD once per pass instead of once per chunk (a 512-token chunk touches nearly all of them) |
 | `--mtp` | MTP speculative decoding |
 | `--preload` | fill the expert caches from the learned hot-expert profile at start |
 | `--profile FILE` / `--no-profile` | where usage statistics are kept (default `hot-experts.txt`) |
 | `--prefetch K` | prefetch K predicted experts of the next layer while decoding (default 2) |
 | `--cache-aware M` | cache-aware routing: an uncached expert of rank 3-8 is replaced by a cached one whose routing score is within M (default 0 = exact). 0.1 = +65% decode speed at unchanged perplexity on our test; 0.2 = +95% at +1.3% perplexity |
 | `--kv-cache q8` | store the context (MLA latents) as Q8: 47% smaller (~0.85 GB saved at 128K), no measurable quality change |
-| `--idle-unload SECS` | chat/serve: after this many idle seconds, free all VRAM and RAM (incl. the CUDA context); the next message/request reloads in ~5 s (default 120, 0 = never) |
+| `--idle-unload SECS` | chat/serve: after this many idle seconds, free all VRAM and RAM (incl. the CUDA context); the next message/request reloads in ~5 s (default 120, 0 = never). The conversation's prompt cache is parked in a temp file meanwhile, so the conversation continues without being re-read |
+| `--no-reasoning-replay` | serve: when a client sends an earlier answer back without its `reasoning_content` (most OpenAI clients do), the server normally puts the reasoning back, so the conversation stays identical to what the model processed and its prompt cache is reused. This flag renders the history exactly as the client sent it (the earlier answer is re-read: slower) |
 | `--max-output N` | chat/serve: max tokens per answer, reasoning included (default 0 = no limit: the answer runs until the model stops or the context window is full). In serve, a request's own `max_tokens` takes precedence |
 | `--snapshots N` | prompt-cache snapshots kept in RAM (~150 MB each) |
 | `--temp --top-p --top-k --min-p --seed` | sampling |
@@ -79,7 +81,13 @@ A prompt that does not fit gets HTTP 400 `context_length_exceeded`.
 The server supports streaming (`reasoning_content` and `content` deltas), tools (OpenAI format,
 mapped to GLM's `<tool_call>` XML), `reasoning_effort`, `stop`, and `stream_options.include_usage`.
 Requests are served one at a time; consecutive requests that share a prefix (multi-turn chats,
-agent loops) reuse it.
+agent loops) reuse it: only the new tokens are processed (`usage.prompt_tokens_details.cached_tokens`).
+
+Time to first token is the prefill of the new tokens. Every token routes to 8 of 288 experts
+per layer, so even a short new message reads several GB from the SSD (~2 s for a 10-token
+follow-up), and a fresh prompt of more than ~100 tokens reads nearly every expert not in cache
+once (~10-15 s), plus the compute for its length. If your client hides `reasoning_content`, the
+wait you see also includes the thinking: use `reasoning_effort` low or high for snappier replies.
 
 Diagnostics: `glm-ssd ppl --file text.txt` (perplexity + speed in decode mode, to compare
 options), `inspect`, `qtest`, `qbench`, `iobench`, `tokenize`, `template`, `run --trace`

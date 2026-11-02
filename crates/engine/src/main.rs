@@ -78,6 +78,11 @@ struct EngineArgs {
     /// Prefill chunk (tokens per batched forward; bigger = faster prefill, more VRAM)
     #[arg(long, default_value_t = 512)]
     chunk: usize,
+    /// Prefill: tokens per pass over the model. Each layer runs over all of them before the next,
+    /// so the uncached experts are read from the SSD once per pass instead of once per chunk.
+    /// Costs ~100 KB VRAM per token (8192 = ~0.8 GB); 0 = chunk by chunk
+    #[arg(long, default_value_t = 8192)]
+    prefill_batch: usize,
     /// Enable MTP speculative decoding (draft 1 token with the NextN layer, verify in 1 pass)
     #[arg(long)]
     mtp: bool,
@@ -212,6 +217,10 @@ enum Cmd {
         /// model stops or the context window fills)
         #[arg(long, alias = "max-tokens", default_value_t = 0)]
         max_output: usize,
+        /// Don't put the reasoning of earlier answers back when a client sends the conversation
+        /// without it (they are then re-read without reasoning: slower, follows the client exactly)
+        #[arg(long)]
+        no_reasoning_replay: bool,
     },
     /// Decode benchmark: chat prompt -> N generated tokens (greedy), steady-state speed
     Bench {
@@ -335,7 +344,7 @@ fn main() -> Result<()> {
         Cmd::Chat { eng, sample, system, effort, hide_think, max_output } => {
             chat_repl(&eng, &sample, system, effort, hide_think, max_output)?
         }
-        Cmd::Serve { eng, sample, addr, name, max_output } => {
+        Cmd::Serve { eng, sample, addr, name, max_output, no_reasoning_replay } => {
             let g = gguf::Gguf::open_shard(&eng.model)?;
             let model = holder(&eng);
             drop(model.lock()?); // load now so the first request is fast; idle clock starts
@@ -347,6 +356,7 @@ fn main() -> Result<()> {
                 default_max_tokens: if max_output == 0 { usize::MAX } else { max_output },
                 ctx: eng.ctx,
                 sampler: sample.cfg(),
+                replay: (!no_reasoning_replay).then(Default::default),
             };
             server::serve(&addr, srv)?;
         }
@@ -397,6 +407,7 @@ fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
         mtp: a.mtp,
         kv_q8: a.kv_cache == "q8",
         cache_aware: a.cache_aware,
+        sweep: a.prefill_batch,
         cache: experts::CacheConfig {
             prefetch: a.prefetch,
             vram_bytes: vram,
@@ -648,6 +659,7 @@ fn holder(a: &EngineArgs) -> std::sync::Arc<holder::ModelHolder> {
 }
 
 fn finish(model: &holder::ModelHolder) -> Result<()> {
+    model.discard_parked();
     if model.is_loaded() {
         model.lock()?.get().eng.experts.save_profile()?;
     }
