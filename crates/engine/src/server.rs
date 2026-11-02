@@ -321,6 +321,7 @@ fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Resu
         (None, Some(req))
     };
 
+    log_divergence(&s.vocab, sess.history(), &toks);
     let mut stats = GenStats::default();
     let t0 = std::time::Instant::now();
     let logits = match sess.prefill(&toks, &mut stats, |_, _| {}) {
@@ -456,4 +457,31 @@ fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Resu
             "choices": [{"index": 0, "text": content, "finish_reason": finish}], "usage": usage})
     };
     json_response(req, 200, &body)
+}
+
+/// When a request does not continue the cached conversation, say where and how it differs: the
+/// tokens before that point are reused, the rest is processed again.
+fn log_divergence(vocab: &Vocab, hist: &[u32], toks: &[u32]) {
+    let lcp = hist.iter().zip(toks).take_while(|(a, b)| a == b).count();
+    if hist.is_empty() || lcp >= hist.len() {
+        return; // nothing cached, or an exact continuation
+    }
+    let show = |t: &[u32]| {
+        if t.is_empty() {
+            return "(end)".to_string();
+        }
+        let s = vocab.decode(t);
+        let s: String = s.chars().take(160).collect();
+        format!("{s:?}")
+    };
+    let before = &toks[lcp.saturating_sub(12)..lcp];
+    eprintln!(
+        "(prompt cache: request differs from the cached conversation at token {lcp} of {}; after {}
+   cached:  {}
+   request: {})",
+        hist.len(),
+        show(before),
+        show(&hist[lcp..(lcp + 24).min(hist.len())]),
+        show(&toks[lcp..(lcp + 24).min(toks.len())]),
+    );
 }
