@@ -112,11 +112,8 @@ GS_EXPORT int gs_gemm(int type, const void *W, int64_t row_stride, int K, int ro
     bool ok = gs_dispatch_type(type, [&]<class Q>() {
         if (K % Q::QK != 0) { bad = true; return; }
         const int sm = gemm_smem<Q>();
-        static bool attr_set = false;
-        if (!attr_set && sm > 48 * 1024) {
-            cudaFuncSetAttribute(k_gemm<Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
-            attr_set = true;
-        }
+        // set on every call (cheap): a cached flag would go stale after gs_device_reset
+        if (sm > 48 * 1024) cudaFuncSetAttribute(k_gemm<Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
         dim3 grid((rows + GBM - 1) / GBM, (N + GBN - 1) / GBN, n_batch);
         k_gemm<Q><<<grid, 256, sm, (cudaStream_t) stream>>>((const uint8_t *) W, row_stride, K, rows, X, x_stride, Y,
                                                              y_stride, N, accumulate, w_bs, x_bs, y_bs);

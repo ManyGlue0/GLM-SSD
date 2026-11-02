@@ -34,6 +34,7 @@ pub mod ffi {
         pub fn gs_stream_destroy(s: *mut c_void) -> i32;
         pub fn gs_stream_sync(s: *mut c_void) -> i32;
         pub fn gs_device_sync() -> i32;
+        pub fn gs_device_reset() -> i32;
         pub fn gs_memcpy_h2d(dst: *mut c_void, src: *const c_void, n: usize, s: *mut c_void) -> i32;
         pub fn gs_memcpy_d2h(dst: *mut c_void, src: *const c_void, n: usize, s: *mut c_void) -> i32;
         pub fn gs_memcpy_d2d(dst: *mut c_void, src: *const c_void, n: usize, s: *mut c_void) -> i32;
@@ -143,6 +144,12 @@ pub mod ops {
             )
         })
     }
+}
+
+/// Release the CUDA context and everything in it. Call only after every buffer, stream and
+/// event has been dropped; the next CUDA call starts a fresh context.
+pub fn device_reset() -> Result<()> {
+    check(unsafe { ffi::gs_device_reset() })
 }
 
 /// Free / total device memory in bytes.

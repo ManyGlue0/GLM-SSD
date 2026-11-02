@@ -513,12 +513,11 @@ GS_EXPORT int gs_mla_attn(const float *q, const void *C, const void *C_scales, c
                           const int *cnt, float scale, float *o, float *part, int T, int H, int R, int splits, void *s) {
     if (R != 512 || H % MLA_HG != 0 || splits < 1) return (int) cudaErrorInvalidValue;
     const size_t sm = mla_smem(R);
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(k_mla_flash<512, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+    // set on every call (cheap): a cached flag would go stale after gs_device_reset
+    if (C_scales)
         cudaFuncSetAttribute(k_mla_flash<512, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
-        attr = true;
-    }
+    else
+        cudaFuncSetAttribute(k_mla_flash<512, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
     dim3 grid(splits, H / MLA_HG, T);
     if (C_scales)
         k_mla_flash<512, true><<<grid, 256, sm, (cudaStream_t) s>>>(q, C, (const half *) C_scales, sel, sel_stride, cnt, scale,

@@ -3,16 +3,18 @@
 //! shared session gives prefix (prompt) caching across requests of the same conversation.
 
 use crate::chat::{parse_output, ChatTemplate, Piece, StreamParser};
-use crate::session::{GenStats, Sampler, SamplerCfg, Session};
+use crate::holder::ModelHolder;
+use crate::session::{GenStats, Sampler, SamplerCfg};
 use crate::tokenizer::Vocab;
 use anyhow::{Context, Result};
 use serde_json::{json, Value as Json};
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Server {
-    pub session: Session,
+    /// the engine, loaded on demand and unloaded when idle
+    pub model: Arc<ModelHolder>,
     pub vocab: Vocab,
     pub tmpl: ChatTemplate,
     pub model_name: String,
@@ -32,7 +34,7 @@ fn id(prefix: &str) -> String {
 pub fn serve(addr: &str, srv: Server) -> Result<()> {
     let http = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
     eprintln!("listening on http://{addr}  (POST /v1/chat/completions, /v1/completions; GET /v1/models)");
-    let srv = Arc::new(Mutex::new(srv));
+    let srv = Arc::new(srv);
     for req in http.incoming_requests() {
         let srv = srv.clone();
         std::thread::spawn(move || {
@@ -57,7 +59,7 @@ fn error(req: tiny_http::Request, code: u16, msg: &str) -> Result<()> {
     json_response(req, code, &json!({"error": {"message": msg, "type": "invalid_request_error"}}))
 }
 
-fn handle(mut req: tiny_http::Request, srv: &Arc<Mutex<Server>>) -> Result<()> {
+fn handle(mut req: tiny_http::Request, srv: &Arc<Server>) -> Result<()> {
     let url = req.url().split('?').next().unwrap_or("").to_string();
     let method = req.method().clone();
     match (&method, url.as_str()) {
@@ -69,9 +71,9 @@ fn handle(mut req: tiny_http::Request, srv: &Arc<Mutex<Server>>) -> Result<()> {
             req.respond(r)?;
             Ok(())
         }
-        (tiny_http::Method::Get, "/health") => json_response(req, 200, &json!({"status": "ok"})),
+        (tiny_http::Method::Get, "/health") => json_response(req, 200, &json!({"status": "ok", "model_loaded": srv.model.is_loaded()})),
         (tiny_http::Method::Get, "/v1/models") => {
-            let name = srv.lock().unwrap().model_name.clone();
+            let name = srv.model_name.clone();
             json_response(req, 200, &json!({"object": "list", "data": [{"id": name, "object": "model", "created": now(), "owned_by": "glm-ssd"}]}))
         }
         (tiny_http::Method::Post, "/v1/chat/completions") | (tiny_http::Method::Post, "/v1/completions") => {
@@ -82,8 +84,7 @@ fn handle(mut req: tiny_http::Request, srv: &Arc<Mutex<Server>>) -> Result<()> {
                 Err(e) => return error(req, 400, &format!("invalid JSON: {e}")),
             };
             let chat = url == "/v1/chat/completions";
-            let mut s = srv.lock().unwrap();
-            completion(req, &mut s, &j, chat)
+            completion(req, srv, &j, chat)
         }
         _ => error(req, 404, "not found"),
     }
@@ -114,7 +115,7 @@ impl Sse {
     }
 }
 
-fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> Result<()> {
+fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Result<()> {
     let stream = j["stream"].as_bool().unwrap_or(false);
     let include_usage = j["stream_options"]["include_usage"].as_bool().unwrap_or(false);
     let max_tokens = j["max_completion_tokens"].as_u64().or(j["max_tokens"].as_u64()).map(|v| v as usize).unwrap_or(s.default_max_tokens);
@@ -154,6 +155,12 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
         }
     };
     let toks = s.vocab.encode(&prompt, true);
+    // one request at a time; loads the model if it was unloaded for being idle
+    let mut st = match s.model.lock() {
+        Ok(st) => st,
+        Err(e) => return error(req, 500, &format!("loading the model: {e:#}")),
+    };
+    let sess = st.get();
     let in_think = chat && prompt.trim_end().ends_with("<think>");
     let rid = id(if chat { "chatcmpl" } else { "cmpl" });
     let model = s.model_name.clone();
@@ -178,7 +185,7 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
 
     let mut stats = GenStats::default();
     let t0 = std::time::Instant::now();
-    let logits = match s.session.prefill(&toks, &mut stats, |_, _| {}) {
+    let logits = match sess.prefill(&toks, &mut stats, |_, _| {}) {
         Ok(l) => l,
         Err(e) => {
             if let Some(r) = req_opt.take() {
@@ -193,9 +200,9 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
     let mut n_gen = 0usize;
     let mut hit_eos = false;
     let mut stopped = false;
-    let eos = s.session.eng.cfg.eos.clone();
+    let eos = sess.eng.cfg.eos.clone();
     let mut content_sent = String::new();
-    let res = s.session.generate(logits, max_tokens, &mut sampler, &mut stats, |tok| {
+    let res = sess.generate(logits, max_tokens, &mut sampler, &mut stats, |tok| {
         n_gen += 1;
         if eos.contains(&tok) {
             hit_eos = true;
@@ -261,11 +268,13 @@ fn completion(req: tiny_http::Request, s: &mut Server, j: &Json, chat: bool) -> 
         .map(|(i, c)| json!({"index": i, "id": format!("call_{}_{i}", &rid[rid.len().saturating_sub(8)..]), "type": "function",
             "function": {"name": c.name, "arguments": c.arguments.to_string()}}))
         .collect();
-    eprintln!("[{}] {} | {}", rid, stats.line(), s.session.eng.experts.summary());
-    if let Err(e) = s.session.eng.experts.save_profile() {
+    eprintln!("[{}] {} | {}", rid, stats.line(), sess.eng.experts.summary());
+    if let Err(e) = sess.eng.experts.save_profile() {
         eprintln!("warning: saving the hot-expert profile: {e:#}");
     }
     let _ = t0;
+    st.touch();
+    drop(st);
 
     if let Some(mut sse) = sse {
         if chat {

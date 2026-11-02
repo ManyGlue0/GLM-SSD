@@ -2,6 +2,7 @@ mod chat;
 mod config;
 mod experts;
 mod forward;
+mod holder;
 mod io;
 mod model;
 mod plan;
@@ -105,6 +106,10 @@ struct EngineArgs {
     /// within this margin (0 = exact routing; trades a little quality for fewer SSD reads)
     #[arg(long, default_value_t = 0.0)]
     cache_aware: f32,
+    /// chat/serve: unload the model (free VRAM + RAM) after this many idle seconds; it reloads on
+    /// the next message/request (0 = never)
+    #[arg(long, default_value_t = 120)]
+    idle_unload: u64,
     /// Decode: prefetch this many of the next layer's predicted experts (0 = off)
     #[arg(long, default_value_t = 2)]
     prefetch: usize,
@@ -329,11 +334,13 @@ fn main() -> Result<()> {
             chat_repl(&eng, &sample, system, effort, hide_think, max_tokens)?
         }
         Cmd::Serve { eng, sample, addr, name, max_tokens } => {
-            let (g, session) = start(&eng)?;
+            let g = gguf::Gguf::open_shard(&eng.model)?;
+            let model = holder(&eng);
+            drop(model.lock()?); // load now so the first request is fast; idle clock starts
             let srv = server::Server {
                 vocab: tokenizer::Vocab::from_gguf(&g)?,
                 tmpl: chat::ChatTemplate::from_gguf(&g)?,
-                session,
+                model,
                 model_name: name,
                 default_max_tokens: max_tokens,
                 sampler: sample.cfg(),
@@ -477,9 +484,11 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
 }
 
 fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort: Option<String>, hide_think: bool, max_tokens: usize) -> Result<()> {
-    let (g, mut sess) = start(a)?;
+    let g = gguf::Gguf::open_shard(&a.model)?;
     let vocab = tokenizer::Vocab::from_gguf(&g)?;
     let tmpl = chat::ChatTemplate::from_gguf(&g)?;
+    let model = holder(a);
+    drop(model.lock()?);
     let mut sampler = session::Sampler::new(sample.cfg());
     let mut messages: Vec<Json> = Vec::new();
     if let Some(s) = &system {
@@ -495,7 +504,7 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
         std::io::stdout().flush()?;
         let mut input = String::new();
         loop {
-            let Some(line) = lines.next() else { return finish(&mut sess) };
+            let Some(line) = lines.next() else { return finish(&model) };
             let line = line?;
             if let Some(l) = line.strip_suffix('\\') {
                 input.push_str(l);
@@ -508,14 +517,18 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
         let input = input.trim().to_string();
         match input.as_str() {
             "" => continue,
-            "/exit" | "/quit" => return finish(&mut sess),
+            "/exit" | "/quit" => return finish(&model),
             "/reset" => {
                 messages.retain(|m| m["role"] == "system");
                 println!("(conversation cleared)");
                 continue;
             }
             "/stats" => {
-                println!("{}", sess.eng.experts.summary());
+                if model.is_loaded() {
+                    println!("{}", model.lock()?.get().eng.experts.summary());
+                } else {
+                    println!("(model unloaded)");
+                }
                 continue;
             }
             "/think" => {
@@ -534,6 +547,8 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
         let prompt = tmpl.render(&Json::Array(messages.clone()), None, effort.as_deref(), true)?;
         let toks = vocab.encode(&prompt, true);
         let mut stats = session::GenStats::default();
+        let mut st = model.lock()?;
+        let sess = st.get();
         let logits = sess.prefill(&toks, &mut stats, |i, n| {
             if n > 256 {
                 eprint!("\r\x1b[2mprefill {i}/{n}\x1b[0m");
@@ -585,11 +600,21 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
         messages.push(msg);
         eprintln!("\x1b[2m[{} | {}]\x1b[0m", stats.line(), sess.eng.experts.summary());
         sess.eng.experts.save_profile().context("saving the hot-expert profile")?;
+        st.touch();
     }
 }
 
-fn finish(sess: &mut session::Session) -> Result<()> {
-    sess.eng.experts.save_profile()?;
+/// The engine behind chat / serve: loaded on demand, unloaded after --idle-unload seconds.
+fn holder(a: &EngineArgs) -> std::sync::Arc<holder::ModelHolder> {
+    let args = a.clone();
+    let idle = (a.idle_unload > 0).then(|| std::time::Duration::from_secs(a.idle_unload));
+    holder::ModelHolder::new(move || start(&args).map(|(_, s)| s), idle)
+}
+
+fn finish(model: &holder::ModelHolder) -> Result<()> {
+    if model.is_loaded() {
+        model.lock()?.get().eng.experts.save_profile()?;
+    }
     Ok(())
 }
 

@@ -48,6 +48,9 @@ GS_EXPORT int gs_stream_create(void **s) {
 GS_EXPORT int gs_stream_destroy(void *s) { return (int) cudaStreamDestroy((cudaStream_t) s); }
 GS_EXPORT int gs_stream_sync(void *s) { return (int) cudaStreamSynchronize((cudaStream_t) s); }
 GS_EXPORT int gs_device_sync() { return (int) cudaDeviceSynchronize(); }
+// Destroy the CUDA context (frees everything the process holds on the GPU). All CUDA objects
+// must already be released; the next CUDA call creates a fresh context.
+GS_EXPORT int gs_device_reset() { return (int) cudaDeviceReset(); }
 
 GS_EXPORT int gs_memcpy_h2d(void *dst, const void *src, size_t n, void *s) {
     return (int) cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, (cudaStream_t) s);
