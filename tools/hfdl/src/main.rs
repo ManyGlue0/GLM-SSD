@@ -23,24 +23,32 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HF: &str = "https://huggingface.co";
+const DEFAULT_REPO: &str = "unsloth/GLM-5.3-Flash-GGUF";
 const URL_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 const FLUSH_BYTES: usize = 8 << 20;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Repository id
-    #[arg(long, default_value = "unsloth/GLM-5.3-Flash-GGUF")]
+    /// Repository id (owner/name) or a Hugging Face URL
+    #[arg(long, default_value = DEFAULT_REPO)]
     repo: String,
+    /// Hugging Face URL of a repo, folder or file, e.g.
+    /// https://huggingface.co/owner/name/tree/main/UD-IQ2_XXS (sets --repo, --revision, --include)
+    #[arg(long, conflicts_with = "repo")]
+    url: Option<String>,
     /// Branch / tag / commit
     #[arg(long, default_value = "main")]
     revision: String,
-    /// Glob(s) matched against repo paths (repeatable)
-    #[arg(long, default_values_t = vec!["UD-IQ2_XXS/*".to_string()])]
+    /// Glob(s) matched against repo paths (repeatable). Default: UD-IQ2_XXS/* for the official
+    /// repo; for other repos the GGUF model is picked automatically when there is only one
+    /// (or only one IQ2_XXS), otherwise the choices are listed
+    #[arg(long)]
     include: Vec<String>,
-    /// Output directory (repo folder structure is preserved inside it)
-    #[arg(long, default_value = "models")]
-    out: PathBuf,
+    /// Output directory (repo folder structure is preserved inside it). Default: models/ for the
+    /// official repo, models/<owner>--<name>/ for others
+    #[arg(long)]
+    out: Option<PathBuf>,
     /// Parallel connections
     #[arg(short = 'c', long, default_value_t = 16)]
     connections: usize,
@@ -116,21 +124,56 @@ async fn main() -> Result<()> {
         .build()?;
 
     // ---- list files --------------------------------------------------------------------
+    let mut args = args;
+    let link = args.url.take().or_else(|| {
+        let r = &args.repo;
+        (r.contains("://") || r.starts_with("huggingface.co/") || r.starts_with("hf.co/")).then(|| r.clone())
+    });
+    if let Some(u) = link {
+        let (repo, rev, path) = parse_url(&u)?;
+        args.repo = repo;
+        if let Some(r) = rev {
+            args.revision = r;
+        }
+        if let (Some(p), true) = (path, args.include.is_empty()) {
+            args.include.push(p);
+        }
+    }
+    if args.repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+        bail!("--repo must look like owner/name or be a Hugging Face URL (got {:?})", args.repo);
+    }
+    let official = args.repo.eq_ignore_ascii_case(DEFAULT_REPO);
+    // Other repos get their own folder: their files often have the same names as the official
+    // ones (UD-IQ2_XXS/...) and would otherwise overwrite them.
+    let out = args.out.clone().unwrap_or_else(|| {
+        if official { PathBuf::from("models") } else { Path::new("models").join(args.repo.replace('/', "--")) }
+    });
+    let entries = list_tree(&api, &args.repo, &args.revision, token.as_deref()).await?;
+    let entries: Vec<TreeEntry> = entries.into_iter().filter(|e| e.kind == "file").collect();
+    if args.include.is_empty() {
+        args.include = if official { vec!["UD-IQ2_XXS/*".to_string()] } else { pick_model(&args.repo, &entries)? };
+    }
     let mut gs = GlobSetBuilder::new();
     for g in &args.include {
         gs.add(Glob::new(g).with_context(|| format!("bad glob {g}"))?);
     }
     let gs = gs.build()?;
-    let entries = list_tree(&api, &args.repo, &args.revision, token.as_deref()).await?;
-    let mut files: Vec<TreeEntry> =
-        entries.into_iter().filter(|e| e.kind == "file" && gs.is_match(&e.path)).collect();
+    let mut files: Vec<TreeEntry> = entries.into_iter().filter(|e| gs.is_match(&e.path)).collect();
     if files.is_empty() {
         bail!("no files in {} match {:?}", args.repo, args.include);
     }
     files.sort_by_key(|e| e.size); // small files first -> metadata available early
 
     let total: u64 = files.iter().map(|f| f.size).sum();
-    println!("{} file(s), {:.2} GB total:", files.len(), total as f64 / 1e9);
+    println!(
+        "{} @ {}: {} file(s), {:.2} GB total -> {}",
+        args.repo,
+        args.revision,
+        files.len(),
+        total as f64 / 1e9,
+        out.display()
+    );
+    let first = shard_one(&files.iter().map(|f| f.path.clone()).collect::<Vec<_>>());
     for f in &files {
         println!("  {:>10.3} GB  {}", f.size as f64 / 1e9, f.path);
     }
@@ -144,7 +187,7 @@ async fn main() -> Result<()> {
     let mut jobs = Vec::new();
     let mut already = 0u64;
     for e in files {
-        let final_path = args.out.join(&e.path);
+        let final_path = out.join(&e.path);
         if let Some(p) = final_path.parent() {
             std::fs::create_dir_all(p)?;
         }
@@ -309,8 +352,100 @@ async fn main() -> Result<()> {
     if failed {
         bail!("some files failed verification (they were renamed to *.corrupt); rerun to re-download them");
     }
-    println!("done -> {}", args.out.display());
+    println!("done -> {}", out.display());
+    if let (Some(f), false) = (first, official) {
+        let p = std::fs::canonicalize(out.join(&f)).unwrap_or_else(|_| out.join(&f));
+        let p = p.to_string_lossy();
+        let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
+        println!("run it with:  glm-ssd chat -m \"{p}\" --vram-budget 22G --ram-budget 12G");
+    }
     Ok(())
+}
+
+/// `https://huggingface.co/owner/name[/tree|blob|resolve/REV[/path]]` -> (repo, rev, include glob).
+/// A folder becomes `folder/*`; a shard `X-00002-of-00004.gguf` becomes all shards of X.
+fn parse_url(u: &str) -> Result<(String, Option<String>, Option<String>)> {
+    let s = u.trim();
+    let s = s.split(['?', '#']).next().unwrap_or(s).trim_end_matches('/');
+    let s = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    let s = s
+        .strip_prefix("huggingface.co/")
+        .or_else(|| s.strip_prefix("hf.co/"))
+        .ok_or_else(|| anyhow!("not a Hugging Face URL: {u}"))?;
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 || matches!(parts[0], "datasets" | "spaces") {
+        bail!("expected a model repo URL like https://huggingface.co/owner/name (got {u})");
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let (mut rev, mut path) = (None, None);
+    if parts.len() >= 4 && matches!(parts[2], "tree" | "blob" | "resolve") {
+        rev = Some(parts[3].to_string());
+        if parts.len() > 4 {
+            let p = parts[4..].join("/");
+            path = Some(if parts[2] == "tree" { format!("{p}/*") } else { shard_glob(&p) });
+        }
+    }
+    Ok((repo, rev, path))
+}
+
+/// `X-00002-of-00004.gguf` -> ("X", "00004")
+fn shard_parts(p: &str) -> Option<(&str, &str)> {
+    let stem = p.strip_suffix(".gguf")?;
+    let (head, n) = stem.rsplit_once("-of-")?;
+    let (base, i) = head.rsplit_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(i) && digits(n)).then_some((base, n))
+}
+
+/// `dir/X-00002-of-00004.gguf` -> `dir/X-*-of-00004.gguf`; other paths unchanged.
+fn shard_glob(p: &str) -> String {
+    match shard_parts(p) {
+        Some((base, n)) => format!("{base}-*-of-{n}.gguf"),
+        None => p.to_string(),
+    }
+}
+
+/// The file to pass to `-m`: shard 1 of a split model, or the single .gguf.
+fn shard_one(paths: &[String]) -> Option<String> {
+    let ggufs: Vec<&String> = paths.iter().filter(|p| p.ends_with(".gguf")).collect();
+    let one = ggufs.iter().find(|p| shard_parts(p).is_some() && p.contains("-00001-of-"));
+    one.or(ggufs.first()).map(|p| p.to_string())
+}
+
+/// No --include for a repo other than the official one: group its GGUF files into models (all
+/// shards of a split file are one model; mmproj / imatrix files are skipped) and pick one.
+fn pick_model(repo: &str, entries: &[TreeEntry]) -> Result<Vec<String>> {
+    let mut groups: Vec<(String, u64, usize)> = Vec::new(); // (glob, bytes, files)
+    for e in entries {
+        let name = e.path.rsplit('/').next().unwrap_or(&e.path).to_ascii_lowercase();
+        if !name.ends_with(".gguf") || name.contains("mmproj") || name.contains("imatrix") {
+            continue;
+        }
+        let g = shard_glob(&e.path);
+        match groups.iter_mut().find(|x| x.0 == g) {
+            Some(x) => {
+                x.1 += e.size;
+                x.2 += 1;
+            }
+            None => groups.push((g, e.size, 1)),
+        }
+    }
+    if groups.is_empty() {
+        bail!("no .gguf files in {repo}: this engine needs a GGUF model (use --include to fetch other files)");
+    }
+    let iq2: Vec<&(String, u64, usize)> = groups.iter().filter(|g| g.0.to_ascii_uppercase().contains("IQ2_XXS")).collect();
+    let pick = if groups.len() == 1 { Some(&groups[0]) } else if iq2.len() == 1 { Some(iq2[0]) } else { None };
+    if let Some(g) = pick {
+        println!("picked {} ({:.2} GB in {} file(s))", g.0, g.1 as f64 / 1e9, g.2);
+        return Ok(vec![g.0.clone()]);
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut msg = format!("{repo} has {} GGUF models; choose one with --include:\n", groups.len());
+    for g in &groups {
+        msg += &format!("  --include \"{}\"   ({:.2} GB, {} file(s))\n", g.0, g.1 as f64 / 1e9, g.2);
+    }
+    bail!("{}", msg.trim_end())
 }
 
 fn chunk_len(size: u64, cs: u64, idx: usize) -> u64 {

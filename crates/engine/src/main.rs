@@ -89,9 +89,10 @@ struct EngineArgs {
     /// SSD reader threads
     #[arg(long, default_value_t = 8)]
     io_threads: usize,
-    /// Learned hot-expert profile (read at start for cache priorities, updated on exit)
-    #[arg(long, default_value = DEFAULT_PROFILE)]
-    profile: PathBuf,
+    /// Learned hot-expert profile (read at start for cache priorities, updated on exit).
+    /// Default: models/hot-experts.txt for the default model, hot-experts.txt next to any other
+    #[arg(long)]
+    profile: Option<PathBuf>,
     /// Don't read or write the hot-expert profile
     #[arg(long)]
     no_profile: bool,
@@ -393,6 +394,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Each model keeps its own usage statistics: another fine-tune routes differently.
+fn profile_path(a: &EngineArgs) -> PathBuf {
+    if let Some(p) = &a.profile {
+        return p.clone();
+    }
+    let same = |x: &std::path::Path, y: &std::path::Path| match (std::fs::canonicalize(x), std::fs::canonicalize(y)) {
+        (Ok(x), Ok(y)) => x.parent() == y.parent(),
+        _ => x == y,
+    };
+    match a.model.parent() {
+        Some(dir) if !same(&a.model, std::path::Path::new(DEFAULT_MODEL)) => dir.join("hot-experts.txt"),
+        _ => PathBuf::from(DEFAULT_PROFILE),
+    }
+}
+
 /// Open the model and start the engine + session.
 fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
     let g = gguf::Gguf::open(&a.model)?;
@@ -414,7 +430,7 @@ fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
             ram_bytes: ram_cache,
             io_threads: a.io_threads,
             direct_io: !a.buffered_io,
-            profile: if a.no_profile { None } else { Some(a.profile.clone()) },
+            profile: if a.no_profile { None } else { Some(profile_path(a)) },
         },
     };
     let t0 = std::time::Instant::now();

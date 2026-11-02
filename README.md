@@ -30,6 +30,22 @@ Download the model (resumable, SHA-256 verified):
 .\download.ps1            # = cargo run --release -p hfdl -- (defaults to UD-IQ2_XXS into models/)
 ```
 
+Other GLM-5.3-Flash GGUFs (community fine-tunes / re-quants with the same architecture) download
+the same way from any Hugging Face repo, by URL or id:
+
+```
+.\download.ps1 --url https://huggingface.co/owner/name                       # picks the GGUF model
+.\download.ps1 --url https://huggingface.co/owner/name/tree/main/UD-IQ2_XXS  # a folder
+.\download.ps1 --url https://huggingface.co/owner/name/blob/main/X-00001-of-00004.gguf  # all shards of X
+.\download.ps1 --repo owner/name --include "*IQ2_XXS*" --revision main
+```
+
+Without `--include`, a repo with one GGUF model (or one IQ2_XXS among several) is picked
+automatically; otherwise the available models are listed with their sizes. Files go to
+`models/<owner>--<name>/`, so they never overwrite the official ones, and the script prints the
+`glm-ssd ... -m <first shard>` command at the end. Private/gated repos: set `HF_TOKEN`. Each model
+keeps its own hot-expert profile (`hot-experts.txt` next to it) unless `--profile` is given.
+
 ## Use
 
 Memory budgets are always explicit:
@@ -58,7 +74,7 @@ Useful options:
 | `--prefill-batch N` | prefill tokens per pass over the model (default 8192, ~0.8 GB VRAM; 0 = off). Each layer runs over all of them before the next, so the experts not in cache are read from the SSD once per pass instead of once per chunk (a 512-token chunk touches nearly all of them) |
 | `--mtp` | MTP speculative decoding |
 | `--preload` | fill the expert caches from the learned hot-expert profile at start |
-| `--profile FILE` / `--no-profile` | where usage statistics are kept (default `hot-experts.txt`) |
+| `--profile FILE` / `--no-profile` | where usage statistics are kept (default `models/hot-experts.txt`; for another `-m` model, `hot-experts.txt` in its folder) |
 | `--prefetch K` | prefetch K predicted experts of the next layer while decoding (default 2) |
 | `--cache-aware M` | cache-aware routing: an uncached expert of rank 3-8 is replaced by a cached one whose routing score is within M (default 0 = exact). 0.1 = +65% decode speed at unchanged perplexity on our test; 0.2 = +95% at +1.3% perplexity |
 | `--kv-cache q8` | store the context (MLA latents) as Q8: 47% smaller (~0.85 GB saved at 128K), no measurable quality change |
