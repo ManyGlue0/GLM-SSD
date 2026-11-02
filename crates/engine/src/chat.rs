@@ -67,6 +67,22 @@ impl ChatTemplate {
     }
 }
 
+/// The model's reasoning-effort levels. The chat template knows exactly these (anything else
+/// silently renders as "max"); GLM-5.3 always thinks, there is no way to switch reasoning off.
+pub const EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// Map a requested effort (ours or OpenAI's vocabulary) to a level the model has.
+/// `none`/`off`/`minimal` map to `low` (the least thinking available), `medium` to `high`,
+/// `xhigh` to `max`. None = unknown value.
+pub fn normalize_effort(s: &str) -> Option<&'static str> {
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "minimal" | "min" | "low" => "low",
+        "medium" | "med" | "high" => "high",
+        "xhigh" | "max" | "maximum" => "max",
+        _ => return None,
+    })
+}
+
 /// One parsed tool call.
 #[derive(Clone, Debug)]
 pub struct ToolCall {

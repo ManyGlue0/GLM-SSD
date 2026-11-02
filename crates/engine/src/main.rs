@@ -186,7 +186,7 @@ enum Cmd {
         /// System prompt
         #[arg(long)]
         system: Option<String>,
-        /// Reasoning effort: low | high | max
+        /// Reasoning effort: low | high | max (default max; the model always reasons, `off` maps to low)
         #[arg(long)]
         effort: Option<String>,
         /// Hide the model's reasoning
@@ -345,6 +345,7 @@ fn main() -> Result<()> {
                 model,
                 model_name: name,
                 default_max_tokens: if max_output == 0 { usize::MAX } else { max_output },
+                ctx: eng.ctx,
                 sampler: sample.cfg(),
             };
             server::serve(&addr, srv)?;
@@ -497,7 +498,10 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
     if let Some(s) = &system {
         messages.push(json!({"role": "system", "content": s}));
     }
-    let mut effort = effort;
+    let mut effort: Option<String> = match effort.as_deref() {
+        None => None,
+        Some(e) => Some(effort_level(e)?.to_string()),
+    };
     let mut show_think = !hide_think;
     eprintln!("commands: /exit  /reset  /stats  /effort low|high|max  /think (toggle reasoning display); end a line with \\ to continue it");
     let stdin = std::io::stdin();
@@ -540,8 +544,14 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
                 continue;
             }
             s if s.starts_with("/effort") => {
-                effort = s.split_whitespace().nth(1).map(String::from);
-                println!("(reasoning effort: {})", effort.as_deref().unwrap_or("default"));
+                match s.split_whitespace().nth(1).map(effort_level) {
+                    None => println!("(reasoning effort: {}; levels: low, high, max)", effort.as_deref().unwrap_or("max (default)")),
+                    Some(Ok(e)) => {
+                        effort = Some(e.to_string());
+                        println!("(reasoning effort: {e})");
+                    }
+                    Some(Err(e)) => println!("({e:#})"),
+                }
                 continue;
             }
             _ => {}
@@ -618,6 +628,16 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
         sess.eng.experts.save_profile().context("saving the hot-expert profile")?;
         st.touch();
     }
+}
+
+/// A reasoning-effort level the model has (see `chat::normalize_effort`), with a note when the
+/// request was mapped to something else.
+fn effort_level(e: &str) -> Result<&'static str> {
+    let lvl = chat::normalize_effort(e).with_context(|| format!("unknown effort {e:?}: use low, high or max"))?;
+    if !e.eq_ignore_ascii_case(lvl) {
+        eprintln!("(GLM-5.3 has the effort levels low, high and max and always reasons; {e:?} -> {lvl})");
+    }
+    Ok(lvl)
 }
 
 /// The engine behind chat / serve: loaded on demand, unloaded after --idle-unload seconds.

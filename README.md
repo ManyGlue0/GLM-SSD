@@ -68,6 +68,14 @@ Useful options:
 
 Chat commands: `/effort low|high|max`, `/think` (toggle reasoning display), `/reset`, `/stats`, `/exit`.
 
+Reasoning effort: GLM-5.3 has three levels, `low`, `high` and `max` (the default), and always
+reasons; there is no "off". OpenAI-style values are mapped: `none`/`minimal` → `low`,
+`medium` → `high`, `xhigh` → `max`. The server reads `reasoning_effort` or `reasoning.effort`.
+
+The server reports its context window (`--ctx`) in `GET /v1/models` (`context_length`,
+`max_model_len`, `max_context_length`), `GET /health` and llama.cpp-style `GET /props` (`n_ctx`).
+A prompt that does not fit gets HTTP 400 `context_length_exceeded`.
+
 The server supports streaming (`reasoning_content` and `content` deltas), tools (OpenAI format,
 mapped to GLM's `<tool_call>` XML), `reasoning_effort`, `stop`, and `stream_options.include_usage`.
 Requests are served one at a time; consecutive requests that share a prefix (multi-turn chats,

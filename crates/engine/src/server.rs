@@ -20,6 +20,22 @@ pub struct Server {
     pub model_name: String,
     pub default_max_tokens: usize,
     pub sampler: SamplerCfg,
+    /// context window in tokens (--ctx): prompt + answer
+    pub ctx: usize,
+}
+
+impl Server {
+    /// The /v1/models entry. The context window is given under the names the common clients read
+    /// (OpenRouter/LiteLLM `context_length`, vLLM `max_model_len`, LM Studio `max_context_length`).
+    fn model_card(&self) -> Json {
+        json!({
+            "id": self.model_name, "object": "model", "created": now(), "owned_by": "glm-ssd",
+            "context_length": self.ctx, "context_window": self.ctx,
+            "max_model_len": self.ctx, "max_context_length": self.ctx,
+            "max_output_tokens": if self.default_max_tokens == usize::MAX { self.ctx } else { self.default_max_tokens.min(self.ctx) },
+            "reasoning_efforts": crate::chat::EFFORTS, "default_reasoning_effort": "max",
+        })
+    }
 }
 
 fn now() -> u64 {
@@ -71,11 +87,19 @@ fn handle(mut req: tiny_http::Request, srv: &Arc<Server>) -> Result<()> {
             req.respond(r)?;
             Ok(())
         }
-        (tiny_http::Method::Get, "/health") => json_response(req, 200, &json!({"status": "ok", "model_loaded": srv.model.is_loaded()})),
-        (tiny_http::Method::Get, "/v1/models") => {
-            let name = srv.model_name.clone();
-            json_response(req, 200, &json!({"object": "list", "data": [{"id": name, "object": "model", "created": now(), "owned_by": "glm-ssd"}]}))
+        (tiny_http::Method::Get, "/health") => {
+            json_response(req, 200, &json!({"status": "ok", "model_loaded": srv.model.is_loaded(), "context_length": srv.ctx}))
         }
+        (tiny_http::Method::Get, "/v1/models") => json_response(req, 200, &json!({"object": "list", "data": [srv.model_card()]})),
+        (tiny_http::Method::Get, path) if path.strip_prefix("/v1/models/") == Some(srv.model_name.as_str()) => {
+            json_response(req, 200, &srv.model_card())
+        }
+        // llama.cpp-style properties (read by some clients to learn the context size)
+        (tiny_http::Method::Get, "/props") => json_response(
+            req,
+            200,
+            &json!({"default_generation_settings": {"n_ctx": srv.ctx}, "n_ctx": srv.ctx, "model_alias": srv.model_name}),
+        ),
         (tiny_http::Method::Post, "/v1/chat/completions") | (tiny_http::Method::Post, "/v1/completions") => {
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body)?;
@@ -142,7 +166,20 @@ fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Resu
     };
     let prompt = if chat {
         let Some(msgs) = j.get("messages").filter(|m| m.is_array()) else { return error(req, 400, "messages must be an array") };
-        let effort = j["reasoning_effort"].as_str();
+        // `reasoning_effort` (Chat Completions) or `reasoning: {effort}` (Responses / OpenRouter style)
+        let effort = match j["reasoning_effort"].as_str().or(j["reasoning"]["effort"].as_str()) {
+            None => None,
+            Some(e) => match crate::chat::normalize_effort(e) {
+                Some(e) => Some(e),
+                None => {
+                    return error(
+                        req,
+                        400,
+                        &format!("unsupported reasoning_effort {e:?}: use low, high or max (GLM-5.3 always reasons; none/minimal map to low, medium to high)"),
+                    )
+                }
+            },
+        };
         match s.tmpl.render(msgs, j.get("tools"), effort, true) {
             Ok(p) => p,
             Err(e) => return error(req, 400, &format!("chat template: {e:#}")),
@@ -155,6 +192,15 @@ fn completion(req: tiny_http::Request, s: &Server, j: &Json, chat: bool) -> Resu
         }
     };
     let toks = s.vocab.encode(&prompt, true);
+    if toks.len() >= s.ctx {
+        let msg = format!(
+            "this model's maximum context length is {} tokens, but the prompt has {} tokens (no room left for the answer); restart the server with a larger --ctx",
+            s.ctx,
+            toks.len()
+        );
+        let body = json!({"error": {"message": msg, "type": "invalid_request_error", "code": "context_length_exceeded"}});
+        return json_response(req, 400, &body);
+    }
     // one request at a time; loads the model if it was unloaded for being idle
     let mut st = match s.model.lock() {
         Ok(st) => st,
