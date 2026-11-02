@@ -6,6 +6,6 @@
 #   .\download.ps1 --url https://huggingface.co/owner/name/tree/main/UD-IQ2_XXS   # a folder of it
 #   .\download.ps1 --repo owner/name --include "*IQ2_XXS*"                # same, by repo id
 # Other repos go to .\models\<owner>--<name>\ (never over the official files); at the end the
-# script prints the glm-ssd command with the right -m path.
+# script prints the glm-ssd command (-m takes the folder, or just its name: -m owner--name).
 Set-Location $PSScriptRoot
 cargo run --release -p hfdl -- @args

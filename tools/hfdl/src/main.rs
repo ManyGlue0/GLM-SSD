@@ -353,8 +353,9 @@ async fn main() -> Result<()> {
         bail!("some files failed verification (they were renamed to *.corrupt); rerun to re-download them");
     }
     println!("done -> {}", out.display());
-    if let (Some(f), false) = (first, official) {
-        let p = std::fs::canonicalize(out.join(&f)).unwrap_or_else(|_| out.join(&f));
+    if let (Some(_), false) = (first, official) {
+        // glm-ssd -m takes the folder (any folder name inside models/ works on its own too)
+        let p = std::fs::canonicalize(&out).unwrap_or_else(|_| out.clone());
         let p = p.to_string_lossy();
         let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
         println!("run it with:  glm-ssd chat -m \"{p}\" --vram-budget 22G --ram-budget 12G");

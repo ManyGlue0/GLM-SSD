@@ -23,6 +23,66 @@ use std::path::PathBuf;
 const DEFAULT_MODEL: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf");
 const DEFAULT_PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/hot-experts.txt");
+const MODELS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models");
+
+/// `-m` value: a .gguf file as given; a folder (or a folder name inside models/) -> shard 1 of
+/// the one GGUF model found in it or its subfolders.
+fn model_path(s: &str) -> std::result::Result<PathBuf, String> {
+    let p = PathBuf::from(s);
+    let p = if !p.exists() && p.is_relative() && std::path::Path::new(MODELS_DIR).join(&p).exists() {
+        std::path::Path::new(MODELS_DIR).join(&p)
+    } else {
+        p
+    };
+    if !p.is_dir() {
+        return Ok(p);
+    }
+    let mut found = Vec::new();
+    find_ggufs(&p, 0, &mut found);
+    // one entry per model: split shards share "<base>-*-of-<n>"
+    let mut models: Vec<(String, PathBuf)> = Vec::new();
+    for f in found {
+        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let key = match name.strip_suffix(".gguf").and_then(|st| st.rsplit_once("-of-")).and_then(|(h, n)| h.rsplit_once('-').map(|(b, _)| (b, n))) {
+            Some((b, n)) => format!("{}/{b}-*-of-{n}", f.parent().unwrap_or(&p).display()),
+            None => f.display().to_string(),
+        };
+        match models.iter_mut().find(|m| m.0 == key) {
+            Some(m) if f < m.1 => m.1 = f, // keep the lowest shard number
+            Some(_) => {}
+            None => models.push((key, f)),
+        }
+    }
+    match models.len() {
+        1 => Ok(models.pop().unwrap().1),
+        0 => Err(format!("no .gguf model in {}", p.display())),
+        _ => {
+            let mut msg = format!("{} holds {} models; pass one of them (folder or shard):", p.display(), models.len());
+            models.sort();
+            for m in &models {
+                msg += &format!("\n  {}", m.1.display());
+            }
+            Err(msg)
+        }
+    }
+}
+
+fn find_ggufs(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if depth < 3 {
+                find_ggufs(&p, depth + 1, out);
+            }
+        } else {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if n.ends_with(".gguf") && !n.contains("mmproj") && !n.contains("imatrix") {
+                out.push(p);
+            }
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "glm-ssd", version, about = "SSD-streaming inference engine for GLM-5.3-Flash")]
@@ -33,8 +93,8 @@ struct Cli {
 
 #[derive(clap::Args, Clone)]
 struct ModelArgs {
-    /// Any shard of the GGUF model
-    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
+    /// The model: its folder (also a folder name inside models/), or any shard of it
+    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
     model: PathBuf,
     /// Parse headers only (works on truncated shards, for inspection before download completes)
     #[arg(long)]
@@ -63,8 +123,8 @@ struct BudgetArgs {
 /// Everything needed to start the engine.
 #[derive(clap::Args, Clone)]
 struct EngineArgs {
-    /// Any shard of the GGUF model
-    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
+    /// The model: its folder (also a folder name inside models/), or any shard of it
+    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
     model: PathBuf,
     /// Total VRAM the engine may use: weights + caches + scratch; the rest becomes the expert cache (e.g. 22G)
     #[arg(long)]
@@ -257,14 +317,14 @@ enum Cmd {
     },
     /// Tokenize text with the model's tokenizer (only needs the first shard)
     Tokenize {
-        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
         model: PathBuf,
         /// Text to encode; special tokens like <|user|> are parsed
         text: String,
     },
     /// Render a chat with the model's template (messages as JSON) and tokenize it
     Template {
-        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
         model: PathBuf,
         /// JSON array of messages
         messages: String,

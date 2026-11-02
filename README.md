@@ -42,8 +42,12 @@ the same way from any Hugging Face repo, by URL or id:
 
 Without `--include`, a repo with one GGUF model (or one IQ2_XXS among several) is picked
 automatically; otherwise the available models are listed with their sizes. Files go to
-`models/<owner>--<name>/`, so they never overwrite the official ones, and the script prints the
-`glm-ssd ... -m <first shard>` command at the end. Private/gated repos: set `HF_TOKEN`. Each model
+`models/<owner>--<name>/`, so they never overwrite the official ones. Then point `-m` at the
+folder, or just at its name inside `models/`:
+
+```
+glm-ssd chat -m owner--name --vram-budget 22G --ram-budget 12G
+``` Private/gated repos: set `HF_TOKEN`. Each model
 keeps its own hot-expert profile (`hot-experts.txt` next to it) unless `--profile` is given.
 
 ## Use
@@ -69,6 +73,7 @@ Useful options:
 
 | flag | meaning |
 |---|---|
+| `-m PATH` | the model: a folder (searched with its subfolders; a folder name inside `models/` is enough) or any shard. Default: the official UD-IQ2_XXS. Also `GLMSSD_MODEL` |
 | `--ctx N` | max context (default 32768; 131072 fits on 24 GB) |
 | `--chunk N` | prefill tokens per batched step (default 512) |
 | `--prefill-batch N` | prefill tokens per pass over the model (default 8192, ~0.8 GB VRAM; 0 = off). Each layer runs over all of them before the next, so the experts not in cache are read from the SSD once per pass instead of once per chunk (a 512-token chunk touches nearly all of them) |
