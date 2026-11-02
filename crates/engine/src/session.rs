@@ -98,6 +98,8 @@ pub struct GenStats {
     pub gen_time: Duration,
     pub drafts: usize,
     pub accepted: usize,
+    /// generation stopped because the context window (--ctx) filled up
+    pub ctx_full: bool,
 }
 impl GenStats {
     pub fn line(&self) -> String {
@@ -232,6 +234,11 @@ impl Session {
             produced += 1;
             let go = on_token(cur);
             if eos.contains(&cur) || !go || produced >= max_tokens {
+                break;
+            }
+            if self.eng.pos + 1 > self.eng.ctx {
+                // context window full: stop like a length limit instead of failing the request
+                stats.ctx_full = true;
                 break;
             }
             if self.mtp && self.eng.pos + 2 <= self.eng.ctx {

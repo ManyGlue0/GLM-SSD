@@ -192,9 +192,10 @@ enum Cmd {
         /// Hide the model's reasoning
         #[arg(long)]
         hide_think: bool,
-        /// Max tokens per answer
-        #[arg(long, default_value_t = 8192)]
-        max_tokens: usize,
+        /// Max tokens per answer, reasoning included (0 = no limit: until the model stops or the
+        /// context window fills)
+        #[arg(long, alias = "max-tokens", default_value_t = 0)]
+        max_output: usize,
     },
     /// OpenAI-compatible HTTP server
     Serve {
@@ -207,9 +208,10 @@ enum Cmd {
         /// Model id reported by /v1/models
         #[arg(long, default_value = "glm-5.3-flash")]
         name: String,
-        /// Default max tokens when the request has none
-        #[arg(long, default_value_t = 16384)]
-        max_tokens: usize,
+        /// Max tokens per answer when the request sets no max_tokens (0 = no limit: until the
+        /// model stops or the context window fills)
+        #[arg(long, alias = "max-tokens", default_value_t = 0)]
+        max_output: usize,
     },
     /// Decode benchmark: chat prompt -> N generated tokens (greedy), steady-state speed
     Bench {
@@ -330,10 +332,10 @@ fn main() -> Result<()> {
         }
         Cmd::Bench { eng, message, n_gen } => bench(&eng, &message, n_gen)?,
         Cmd::Ppl { eng, file, warm, n } => ppl(&eng, &file, warm, n)?,
-        Cmd::Chat { eng, sample, system, effort, hide_think, max_tokens } => {
-            chat_repl(&eng, &sample, system, effort, hide_think, max_tokens)?
+        Cmd::Chat { eng, sample, system, effort, hide_think, max_output } => {
+            chat_repl(&eng, &sample, system, effort, hide_think, max_output)?
         }
-        Cmd::Serve { eng, sample, addr, name, max_tokens } => {
+        Cmd::Serve { eng, sample, addr, name, max_output } => {
             let g = gguf::Gguf::open_shard(&eng.model)?;
             let model = holder(&eng);
             drop(model.lock()?); // load now so the first request is fast; idle clock starts
@@ -342,7 +344,7 @@ fn main() -> Result<()> {
                 tmpl: chat::ChatTemplate::from_gguf(&g)?,
                 model,
                 model_name: name,
-                default_max_tokens: max_tokens,
+                default_max_tokens: if max_output == 0 { usize::MAX } else { max_output },
                 sampler: sample.cfg(),
             };
             server::serve(&addr, srv)?;
@@ -483,7 +485,8 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
     Ok(())
 }
 
-fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort: Option<String>, hide_think: bool, max_tokens: usize) -> Result<()> {
+fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort: Option<String>, hide_think: bool, max_output: usize) -> Result<()> {
+    let max_tokens = if max_output == 0 { usize::MAX } else { max_output };
     let g = gguf::Gguf::open_shard(&a.model)?;
     let vocab = tokenizer::Vocab::from_gguf(&g)?;
     let tmpl = chat::ChatTemplate::from_gguf(&g)?;
@@ -553,10 +556,18 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
             if n > 256 {
                 eprint!("\r\x1b[2mprefill {i}/{n}\x1b[0m");
             }
-        })?;
+        });
         if toks.len() > 256 {
             eprint!("\r\x1b[2K");
         }
+        let logits = match logits {
+            Ok(l) => l,
+            Err(e) => {
+                messages.pop();
+                eprintln!("error: {e:#}\n(the message was dropped; /reset starts a new conversation, or restart with a larger --ctx)");
+                continue;
+            }
+        };
         let in_think = prompt.trim_end().ends_with("<think>");
         let mut parser = chat::StreamParser::new(&vocab, in_think);
         let eos = sess.eng.cfg.eos.clone();
@@ -598,6 +609,11 @@ fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort
             msg["reasoning_content"] = json!(reasoning);
         }
         messages.push(msg);
+        if stats.ctx_full {
+            eprintln!("\x1b[33m(answer cut: the context window is full ({} tokens); /reset, or restart with a larger --ctx)\x1b[0m", sess.eng.ctx);
+        } else if stats.gen_tokens >= max_tokens {
+            eprintln!("\x1b[33m(answer cut at --max-output {max_tokens} tokens)\x1b[0m");
+        }
         eprintln!("\x1b[2m[{} | {}]\x1b[0m", stats.line(), sess.eng.experts.summary());
         sess.eng.experts.save_profile().context("saving the hot-expert profile")?;
         st.touch();

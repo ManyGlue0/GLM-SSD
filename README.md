@@ -62,6 +62,7 @@ Useful options:
 | `--cache-aware M` | cache-aware routing: an uncached expert of rank 3-8 is replaced by a cached one whose routing score is within M (default 0 = exact). 0.1 = +65% decode speed at unchanged perplexity on our test; 0.2 = +95% at +1.3% perplexity |
 | `--kv-cache q8` | store the context (MLA latents) as Q8: 47% smaller (~0.85 GB saved at 128K), no measurable quality change |
 | `--idle-unload SECS` | chat/serve: after this many idle seconds, free all VRAM and RAM (incl. the CUDA context); the next message/request reloads in ~5 s (default 120, 0 = never) |
+| `--max-output N` | chat/serve: max tokens per answer, reasoning included (default 0 = no limit: the answer runs until the model stops or the context window is full). In serve, a request's own `max_tokens` takes precedence |
 | `--snapshots N` | prompt-cache snapshots kept in RAM (~150 MB each) |
 | `--temp --top-p --top-k --min-p --seed` | sampling |
 
