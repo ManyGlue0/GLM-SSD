@@ -140,6 +140,16 @@ options), `inspect`, `qtest`, `qbench`, `iobench`, `tokenize`, `template`, `run 
 
 | | |
 |---|---|
-| decode, exact routing | ~5.6 tok/s, ~5.9 tok/s with `--mtp` |
-| decode, `--mtp --cache-aware 0.1` | ~9.4 tok/s |
-| prefill | ~60 tok/s (chunk 1024), ~120 tok/s (chunk 2048) |
+Measured with repacked experts (`glm-ssd repack`), `--chunk 1024 --kv-cache q8 --ctx 65536`, cold
+caches, 300 generated tokens:
+
+| | |
+|---|---|
+| decode, exact routing, `--mtp` | ~6.1 tok/s |
+| decode, `--mtp --cache-aware 0.1` | ~10 tok/s (no measurable perplexity change on our texts) |
+| decode, `--mtp --cache-aware 0.2` | ~12 tok/s (~+2% perplexity) |
+| prefill, fresh 2.1K-token prompt | 18.6 s (~113 tok/s) |
+
+Decode is bound by SSD reads of the experts not in cache (~0.4 GB per token, the drive at its
+random-read maximum while busy); a larger `--ram-budget` / `--vram-budget` is the main lever.
+`glm-ssd run` prints a per-token breakdown (router sync, SSD wait, launches) and SSD utilization.

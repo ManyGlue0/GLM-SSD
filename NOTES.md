@@ -28,8 +28,17 @@ What is the capital of France?<|assistant|>
   round trip: 160/201 prompt tokens reused from the snapshot).
 
 ### Known limits / ideas
-- Decode is SSD-bound (~0.8 GB misses/token at ~6 GB/s). Options: bigger budgets; per-expert
-  contiguous repack (+~15% read throughput); CPU compute for RAM-resident experts (avoids PCIe).
+- Decode is SSD-bound: ~0.4 GB of expert reads per token (user flags), SSD busy ~60% of decode
+  time at ~5.7 GB/s (its random-read max) while busy; the rest is the serial per-layer chain
+  (attention + router -> sync -> misses -> experts). `run` prints the breakdown.
+  Done 2026-11-03: repack (one read per expert, +11%), fused MoE kernels (t = 1 and 2), one
+  router sync per layer, dense cache maps, wide GEMV for few-row matrices.
+  Tried, no gain / rejected: copy kernel instead of cudaMemcpyAsync; deeper, throttled or chunked
+  prefetch (more bytes read than saved); dp4a int8-activation K-quant GEMV (+57% Q5_K bandwidth
+  but +2% ppl); 2-4 rows per warp for K-quant/IQ GEMVs (instruction-bound, more registers);
+  dropping uncached low-weight experts (worse than --cache-aware at equal speed).
+  A/B noise: decode runs vary ~±4%, ppl on 300 tokens ~±0.02; --cache-aware outputs depend on
+  read timing, so check correctness with exact routing.
 - Prefill (layer-major sweep) is SSD-bound for prompts up to a few K tokens: ~70 GB of uncached
   experts per pass. Ideas: prefetch the next layer's hot experts during the current layer's
   MoE; per-expert contiguous repack. Prompts <= one chunk (512) don't use the sweep (no gain).
