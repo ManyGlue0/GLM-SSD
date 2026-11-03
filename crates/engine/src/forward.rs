@@ -996,7 +996,7 @@ impl Engine {
         let lim = self.layers[il].clamp_exp;
         let parts = self.exp_dims[il].context("no expert tensors")?;
         // decode: fused kernels over batches of ready experts (2 launches per batch)
-        let fused = t == 1 && !self.unfused && self.chunk >= cuda::MOE_MAX;
+        let fused = t <= cuda::MOE_NT && !self.unfused && self.chunk >= cuda::MOE_MAX * cuda::MOE_NT;
         while fused {
             let t_n = Instant::now();
             let batch = self.experts.next_batch(&mut fetch, &self.copy, &self.s, cuda::MOE_MAX)?;
@@ -1010,14 +1010,16 @@ impl Engine {
                 b.gate[i] = p.gate;
                 b.up[i] = p.up;
                 b.down[i] = p.down;
-                b.w[i] = groups[*e as usize][0].1;
+                for &(ti, w) in &groups[*e as usize] {
+                    b.w[ti as usize][i] = w;
+                }
             }
             let [wg, _, wd] = &parts;
             ck!(ffi::gs_moe_gateup(
-                wg.ty.id() as i32, &b, wg.row_bytes as i64, wg.d0 as i32, wg.d1 as i32, xn, self.eg.f32(), lim, self.s.raw()
+                wg.ty.id() as i32, &b, t as i32, wg.row_bytes as i64, wg.d0 as i32, wg.d1 as i32, xn, self.eg.f32(), lim, self.s.raw()
             ));
             ck!(ffi::gs_moe_down(
-                wd.ty.id() as i32, &b, wd.row_bytes as i64, wd.d0 as i32, wd.d1 as i32, self.eg.f32(), self.moe_acc.f32(),
+                wd.ty.id() as i32, &b, t as i32, wd.row_bytes as i64, wd.d0 as i32, wd.d1 as i32, self.eg.f32(), self.moe_acc.f32(),
                 self.s.raw()
             ));
             for (e, _) in &batch {

@@ -60,11 +60,11 @@ pub mod ffi {
             w_bs: i64, x_bs: i64, y_bs: i64, s: *mut c_void,
         ) -> i32;
         pub fn gs_moe_gateup(
-            ty: i32, b: *const super::MoeBatch, row_stride: i64, k: i32, rows: i32, x: *const f32, h: *mut f32, lim: f32,
+            ty: i32, b: *const super::MoeBatch, nt: i32, row_stride: i64, k: i32, rows: i32, x: *const f32, h: *mut f32, lim: f32,
             s: *mut c_void,
         ) -> i32;
         pub fn gs_moe_down(
-            ty: i32, b: *const super::MoeBatch, row_stride: i64, k: i32, rows: i32, h: *const f32, y: *mut f32,
+            ty: i32, b: *const super::MoeBatch, nt: i32, row_stride: i64, k: i32, rows: i32, h: *const f32, y: *mut f32,
             s: *mut c_void,
         ) -> i32;
 
@@ -388,6 +388,8 @@ pub fn bytes_of_mut<T: Copy>(v: &mut [T]) -> &mut [u8] {
 
 /// Max experts per fused MoE launch (matches MOE_MAX in quants.cu).
 pub const MOE_MAX: usize = 16;
+/// Max tokens per fused MoE launch (MOE_NT in quants.cu).
+pub const MOE_NT: usize = 2;
 /// Device pointers + routing weights of a batch of experts for the fused MoE kernels.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -395,11 +397,12 @@ pub struct MoeBatch {
     pub gate: [*const u8; MOE_MAX],
     pub up: [*const u8; MOE_MAX],
     pub down: [*const u8; MOE_MAX],
-    pub w: [f32; MOE_MAX],
+    /// routing weight of expert e for token t (0 = not routed)
+    pub w: [[f32; MOE_MAX]; MOE_NT],
     pub n: i32,
 }
 impl Default for MoeBatch {
     fn default() -> Self {
-        Self { gate: [std::ptr::null(); MOE_MAX], up: [std::ptr::null(); MOE_MAX], down: [std::ptr::null(); MOE_MAX], w: [0.0; MOE_MAX], n: 0 }
+        Self { gate: [std::ptr::null(); MOE_MAX], up: [std::ptr::null(); MOE_MAX], down: [std::ptr::null(); MOE_MAX], w: [[0.0; MOE_MAX]; MOE_NT], n: 0 }
     }
 }

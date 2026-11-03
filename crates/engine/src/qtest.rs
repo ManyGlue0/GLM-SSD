@@ -159,11 +159,14 @@ pub fn run(model: Option<&Path>) -> Result<()> {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut all_ok = true;
 
-    println!("random blocks (rows=101, k=4096):");
-    for ty in TYPES {
-        let (rows, k) = (101, 4096);
-        let raw = random_blocks(ty, rows * k, &mut rng);
-        all_ok &= check_matrix(ty, &raw, rows, k, "random", &mut rng, &s)?;
+    // 101 rows: one block per row (few-row kernel); 3001 / 8195 rows: 2 / 4 rows per warp, with a
+    // partial last row group
+    for (rows, k) in [(101, 4096), (3001, 2048), (8195, 2048)] {
+        println!("random blocks (rows={rows}, k={k}):");
+        for ty in TYPES {
+            let raw = random_blocks(ty, rows * k, &mut rng);
+            all_ok &= check_matrix(ty, &raw, rows, k, "random", &mut rng, &s)?;
+        }
     }
 
     if let Some(m) = model {
@@ -205,7 +208,7 @@ pub fn bench() -> Result<()> {
     let mut rng = Rng(42);
     let (rows, k) = (16384usize, 4096usize);
     println!("GEMV {rows}x{k} (weights streamed from VRAM; RTX 3090 peak ~936 GB/s)");
-    println!("  {:<8} {:>9} {:>12} {:>12} {:>12}", "type", "MiB", "B=1 GB/s", "B=4 GB/s", "B=8 GB/s");
+    println!("  {:<8} {:>9} {:>12} {:>12} {:>12} {:>12}", "type", "MiB", "B=1 GB/s", "B=2 GB/s", "B=4 GB/s", "B=8 GB/s");
     for ty in TYPES {
         let raw = random_blocks(ty, rows * k, &mut rng);
         let dw = DeviceBuffer::new(raw.len())?;
@@ -216,7 +219,7 @@ pub fn bench() -> Result<()> {
         let dy = DeviceBuffer::new(8 * rows * 4)?;
         let rs = ty.row_bytes(k as u64) as usize;
         let mut cols = Vec::new();
-        for nv in [1usize, 4, 8] {
+        for nv in [1usize, 2, 4, 8] {
             let run = |s: &Stream| ops::gemv(ty.id(), dw.ptr(), rs, k, rows, dx.ptr() as *const f32, k, dy.ptr() as *mut f32, rows, nv, false, s);
             for _ in 0..3 {
                 run(&s)?;
@@ -232,7 +235,7 @@ pub fn bench() -> Result<()> {
             let ms = a.elapsed_ms(&b)? / iters as f32;
             cols.push(raw.len() as f64 / (ms as f64 * 1e-3) / 1e9);
         }
-        println!("  {:<8} {:>9.1} {:>12.0} {:>12.0} {:>12.0}", format!("{ty:?}"), raw.len() as f64 / 1048576.0, cols[0], cols[1], cols[2]);
+        println!("  {:<8} {:>9.1} {:>12.0} {:>12.0} {:>12.0} {:>12.0}", format!("{ty:?}"), raw.len() as f64 / 1048576.0, cols[0], cols[1], cols[2], cols[3]);
     }
     Ok(())
 }

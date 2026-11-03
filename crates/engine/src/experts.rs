@@ -112,6 +112,7 @@ const CHUNK_SLOTS: usize = 32;
 const MAX_INFLIGHT: usize = 12;
 const MAX_PREFETCH_INFLIGHT: usize = 12;
 
+
 #[derive(Clone, Debug)]
 struct Part {
     info: TensorInfo,
@@ -146,6 +147,11 @@ struct IoQueue {
     hi: VecDeque<Req>,
     lo: VecDeque<Req>,
     quit: bool,
+    /// reads being executed
+    inflight: usize,
+    /// time with at least one read executing
+    busy: Duration,
+    busy_since: Option<Instant>,
 }
 struct IoPool {
     q: Arc<(Mutex<IoQueue>, Condvar)>,
@@ -188,7 +194,7 @@ impl IoPool {
                         let req = {
                             let (m, cv) = &*q;
                             let mut g = m.lock().unwrap();
-                            loop {
+                            let picked = loop {
                                 if g.quit {
                                     return;
                                 }
@@ -196,7 +202,12 @@ impl IoPool {
                                     break r;
                                 }
                                 g = cv.wait(g).unwrap();
+                            };
+                            if g.inflight == 0 {
+                                g.busy_since = Some(Instant::now());
                             }
+                            g.inflight += 1;
+                            picked
                         };
                         let mut res = Ok(0u64);
                         for &(shard, off, len, dst) in &req.reads {
@@ -206,6 +217,15 @@ impl IoPool {
                                 Err(e) => {
                                     res = Err(format!("read shard {shard} @ {off}: {e}"));
                                     break;
+                                }
+                            }
+                        }
+                        {
+                            let mut g = q.0.lock().unwrap();
+                            g.inflight -= 1;
+                            if g.inflight == 0 {
+                                if let Some(t) = g.busy_since.take() {
+                                    g.busy += t.elapsed();
                                 }
                             }
                         }
@@ -230,6 +250,11 @@ impl IoPool {
         }
         cv.notify_all();
         id
+    }
+    /// Total time the SSD had at least one of our reads executing.
+    fn busy_time(&self) -> Duration {
+        let g = self.q.0.lock().unwrap();
+        g.busy + g.busy_since.map_or(Duration::ZERO, |t| t.elapsed())
     }
     /// Move a queued low-priority request to the high queue (a prefetch became a demand).
     fn promote(&self, id: u64) {
@@ -786,6 +811,11 @@ impl ExpertCache {
             }
             // a request we promoted may have been submitted as a prefetch (its id is in `waiting`)
         }
+    }
+
+    /// Time the SSD was busy with our reads (at least one executing).
+    pub fn io_busy(&self) -> Duration {
+        self.io.busy_time()
     }
 
     /// Every expert of the fetch that is on the GPU now (or will be, in stream order), up to

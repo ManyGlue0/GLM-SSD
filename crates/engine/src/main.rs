@@ -556,7 +556,7 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
     let prompt_time = t0.elapsed();
     eprintln!("prefill: {}", eng.experts.summary());
     let mut out = Vec::new();
-    let (tm0, st0) = (eng.timings.clone(), eng.experts.stats.clone());
+    let (tm0, st0, busy0) = (eng.timings.clone(), eng.experts.stats.clone(), eng.experts.io_busy());
     let t1 = std::time::Instant::now();
     for _ in 0..n_predict {
         let l = &logits;
@@ -591,6 +591,13 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
         let (tm, st) = (&eng.timings, &eng.experts.stats);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / out.len() as f64;
         let wait = st.read_time - st0.read_time;
+        let busy = eng.experts.io_busy() - busy0;
+        let mb = (st.read_bytes - st0.read_bytes) as f64 / 1e6 / out.len() as f64;
+        println!(
+            "SSD: {mb:.0} MB/token, busy {:.0}% of decode time ({:.2} GB/s while busy)",
+            100.0 * busy.as_secs_f64() / gen_time.as_secs_f64(),
+            (st.read_bytes - st0.read_bytes) as f64 / 1e9 / busy.as_secs_f64().max(1e-9)
+        );
         println!(
             "decode ms/token: total {:.1} = MoE {:.1} (router sync {:.1}, expert fetch {:.1} of which SSD wait {:.1},              expert launches {:.1}, rest {:.1}) + non-MoE {:.1}",
             ms(gen_time),

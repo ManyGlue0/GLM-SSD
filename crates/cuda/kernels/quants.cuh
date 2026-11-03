@@ -134,9 +134,11 @@ struct QQ4_K : QBase {
         int sc, mn;
         scale_min_k4(2 * jb + hi, b + 4, sc, mn);
         const float d = ldh(b) * sc, m = ldh(b + 2) * mn;
-        const uint8_t *q = b + 16 + 32 * jb + l0;
+        // blocks are 16-byte aligned (144 B) and l0 is a multiple of 8: one 8-byte load
+        const uint2 qq = *(const uint2 *) (b + 16 + 32 * jb + l0);
+        const int sh = hi ? 4 : 0;
 #pragma unroll
-        for (int i = 0; i < 8; i++) v[i] = d * u8f(hi ? (q[i] >> 4) : (q[i] & 15)) - m;
+        for (int i = 0; i < 8; i++) v[i] = d * u8f((((i < 4 ? qq.x : qq.y) >> (8 * (i & 3) + sh)) & 15)) - m;
     }
 };
 
@@ -148,11 +150,16 @@ struct QQ5_K : QBase {
         int sc, mn;
         scale_min_k4(2 * jb + hi, b + 4, sc, mn);
         const float d = ldh(b) * sc, m = ldh(b + 2) * mn;
-        const uint8_t *qh = b + 16 + l0;
-        const uint8_t *q = b + 48 + 32 * jb + l0;
-        const uint8_t u = 1 << (2 * jb + hi);
+        // blocks are 16-byte aligned (176 B) and l0 is a multiple of 8: two 8-byte loads
+        const uint2 hh = *(const uint2 *) (b + 16 + l0);
+        const uint2 qq = *(const uint2 *) (b + 48 + 32 * jb + l0);
+        const int sh = hi ? 4 : 0, hb = 2 * jb + hi;
 #pragma unroll
-        for (int i = 0; i < 8; i++) v[i] = d * u8f((hi ? (q[i] >> 4) : (q[i] & 15)) + ((qh[i] & u) ? 16 : 0)) - m;
+        for (int i = 0; i < 8; i++) {
+            const int o = 8 * (i & 3);
+            const uint32_t lo = ((i < 4 ? qq.x : qq.y) >> (o + sh)) & 15, h = ((i < 4 ? hh.x : hh.y) >> (o + hb)) & 1;
+            v[i] = d * u8f(lo | (h << 4)) - m;
+        }
     }
 };
 
