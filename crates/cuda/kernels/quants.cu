@@ -146,3 +146,114 @@ GS_EXPORT int gs_gemv_batched(int type, const void *W, int64_t row_stride, int K
     if (!ok || bad_k) return (int) cudaErrorInvalidValue;
     return (int) cudaGetLastError();
 }
+
+// ---- fused routed-expert FFN for one token (decode) ---------------------------------------------
+// A batch of up to MOE_MAX experts of one layer whose weights are on the GPU. Two launches per
+// batch instead of five per expert:
+//   gate/up: h[e][r] = swiglu(gate_e[r] . x, up_e[r] . x)      (blockIdx.y = expert)
+//   down:    y[r] += sum_e w_e * (down_e[r] . h[e])             (one warp per output row)
+constexpr int MOE_MAX = 16;
+struct MoeBatch {
+    const uint8_t *gate[MOE_MAX];
+    const uint8_t *up[MOE_MAX];
+    const uint8_t *down[MOE_MAX];
+    float w[MOE_MAX];
+    int n;
+};
+
+template <class Q>
+__global__ void __launch_bounds__(GEMV_WARPS * 32)
+k_moe_gateup(MoeBatch b, int64_t row_stride, int K, int rows, const float *__restrict__ x, float *__restrict__ h, float lim) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    Q::init_smem(sm, threadIdx.x, blockDim.x);
+    __syncthreads();
+    const int e = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int GPB = Q::QK / 8;
+    const int n_groups = K / 8;
+    for (int row = blockIdx.x * GEMV_WARPS + warp; row < rows; row += gridDim.x * GEMV_WARPS) {
+        const uint8_t *wg = b.gate[e] + (int64_t) row * row_stride, *wu = b.up[e] + (int64_t) row * row_stride;
+        float ag = 0.f, au = 0.f;
+        for (int g = lane; g < n_groups; g += 32) {
+            const float4 *xp = (const float4 *) (x + 8 * g);
+            const float4 p = __ldg(xp), q = __ldg(xp + 1);
+            float v[8];
+            Q::deq8(wg + (g / GPB) * Q::BB, g % GPB, v, sm);
+            ag += v[0] * p.x + v[1] * p.y + v[2] * p.z + v[3] * p.w + v[4] * q.x + v[5] * q.y + v[6] * q.z + v[7] * q.w;
+            Q::deq8(wu + (g / GPB) * Q::BB, g % GPB, v, sm);
+            au += v[0] * p.x + v[1] * p.y + v[2] * p.z + v[3] * p.w + v[4] * q.x + v[5] * q.y + v[6] * q.z + v[7] * q.w;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            ag += __shfl_xor_sync(0xffffffff, ag, o);
+            au += __shfl_xor_sync(0xffffffff, au, o);
+        }
+        if (lane == 0) {
+            if (lim > 0.f) {
+                ag = fminf(ag, lim);
+                au = fminf(fmaxf(au, -lim), lim);
+            }
+            h[(int64_t) e * rows + row] = ag / (1.f + expf(-ag)) * au;
+        }
+    }
+}
+
+template <class Q>
+__global__ void __launch_bounds__(GEMV_WARPS * 32)
+k_moe_down(MoeBatch b, int64_t row_stride, int K, int rows, const float *__restrict__ h, float *__restrict__ y) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    Q::init_smem(sm, threadIdx.x, blockDim.x);
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int GPB = Q::QK / 8;
+    const int n_groups = K / 8;
+    for (int row = blockIdx.x * GEMV_WARPS + warp; row < rows; row += gridDim.x * GEMV_WARPS) {
+        float acc = 0.f;
+        for (int e = 0; e < b.n; e++) {
+            const uint8_t *wr = b.down[e] + (int64_t) row * row_stride;
+            const float *he = h + (int64_t) e * K;
+            float a = 0.f;
+            for (int g = lane; g < n_groups; g += 32) {
+                float v[8];
+                Q::deq8(wr + (g / GPB) * Q::BB, g % GPB, v, sm);
+                const float4 *xp = (const float4 *) (he + 8 * g);
+                const float4 p = xp[0], q = xp[1];
+                a += v[0] * p.x + v[1] * p.y + v[2] * p.z + v[3] * p.w + v[4] * q.x + v[5] * q.y + v[6] * q.z + v[7] * q.w;
+            }
+            acc += b.w[e] * a;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
+        if (lane == 0) y[row] += acc;
+    }
+}
+
+static unsigned moe_blocks(int rows, int smem) {
+    if (g_sm_count == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&g_sm_count, cudaDevAttrMultiProcessorCount, dev);
+    }
+    const int need = (rows + GEMV_WARPS - 1) / GEMV_WARPS;
+    const int cap = smem > 0 ? g_sm_count * 16 : need;
+    return (unsigned) (need < cap ? need : cap);
+}
+
+// gate/up: K = n_embd (row length), rows = n_ff; h: [n][rows]. down: K = n_ff, rows = n_embd.
+GS_EXPORT int gs_moe_gateup(int type, const MoeBatch *b, int64_t row_stride, int K, int rows, const float *x, float *h,
+                            float lim, void *s) {
+    if (b->n <= 0 || b->n > MOE_MAX) return (int) cudaErrorInvalidValue;
+    bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        dim3 grid(moe_blocks(rows, Q::SMEM), b->n);
+        k_moe_gateup<Q><<<grid, GEMV_WARPS * 32, Q::SMEM, (cudaStream_t) s>>>(*b, row_stride, K, rows, x, h, lim);
+    });
+    if (!ok) return (int) cudaErrorInvalidValue;
+    return (int) cudaGetLastError();
+}
+GS_EXPORT int gs_moe_down(int type, const MoeBatch *b, int64_t row_stride, int K, int rows, const float *h, float *y, void *s) {
+    if (b->n <= 0 || b->n > MOE_MAX) return (int) cudaErrorInvalidValue;
+    bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        k_moe_down<Q><<<moe_blocks(rows, Q::SMEM), GEMV_WARPS * 32, Q::SMEM, (cudaStream_t) s>>>(*b, row_stride, K, rows, h, y);
+    });
+    if (!ok) return (int) cudaErrorInvalidValue;
+    return (int) cudaGetLastError();
+}

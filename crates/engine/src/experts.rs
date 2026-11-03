@@ -23,6 +23,85 @@ use std::time::{Duration, Instant};
 
 pub type Key = (u16, u16); // (layer, expert)
 
+/// Map from (layer, expert) to T, stored densely: the eviction scans look up several keys per
+/// slot over thousands of slots for every miss, so this must be an index, not a hash.
+#[derive(Clone)]
+struct KeyMap<T: Copy> {
+    n_expert: usize,
+    v: Vec<Option<T>>,
+}
+impl<T: Copy> KeyMap<T> {
+    fn new(n_expert: usize) -> Self {
+        Self { n_expert, v: Vec::new() }
+    }
+    #[inline]
+    fn idx(&self, k: &Key) -> Option<usize> {
+        ((k.1 as usize) < self.n_expert).then(|| k.0 as usize * self.n_expert + k.1 as usize)
+    }
+    #[inline]
+    fn get(&self, k: &Key) -> Option<&T> {
+        self.idx(k).and_then(|i| self.v.get(i)).and_then(|x| x.as_ref())
+    }
+    #[inline]
+    fn contains_key(&self, k: &Key) -> bool {
+        self.get(k).is_some()
+    }
+    fn slot(&mut self, k: Key) -> Option<&mut Option<T>> {
+        let i = self.idx(&k)?;
+        if i >= self.v.len() {
+            self.v.resize(i + 1, None);
+        }
+        Some(&mut self.v[i])
+    }
+    fn insert(&mut self, k: Key, val: T) {
+        if let Some(x) = self.slot(k) {
+            *x = Some(val);
+        }
+    }
+    fn remove(&mut self, k: &Key) -> Option<T> {
+        let i = self.idx(k)?;
+        self.v.get_mut(i).and_then(|x| x.take())
+    }
+    fn get_or_insert(&mut self, k: Key, val: T) -> Option<&mut T> {
+        self.slot(k).map(|x| x.get_or_insert(val))
+    }
+}
+impl<T: Copy> std::ops::Index<&Key> for KeyMap<T> {
+    type Output = T;
+    fn index(&self, k: &Key) -> &T {
+        self.get(k).expect("expert key not in map")
+    }
+}
+
+/// Set of keys with O(1) insert/remove/contains and a clear proportional to its size.
+struct KeySet {
+    map: KeyMap<()>,
+    keys: Vec<Key>,
+}
+impl KeySet {
+    fn new(n_expert: usize) -> Self {
+        Self { map: KeyMap::new(n_expert), keys: Vec::new() }
+    }
+    #[inline]
+    fn contains(&self, k: &Key) -> bool {
+        self.map.contains_key(k)
+    }
+    fn insert(&mut self, k: Key) {
+        if !self.map.contains_key(&k) {
+            self.map.insert(k, ());
+            self.keys.push(k);
+        }
+    }
+    fn remove(&mut self, k: &Key) {
+        self.map.remove(k);
+    }
+    fn clear(&mut self) {
+        for k in self.keys.drain(..) {
+            self.map.remove(&k);
+        }
+    }
+}
+
 /// Per-token decay of the use frequency (default half-life ~350 tokens; GLMSSD_DECAY overrides).
 const DECAY_DEFAULT: f32 = 0.998;
 /// Minimum slots per size class in each tier (enough to pipeline one layer).
@@ -230,11 +309,11 @@ pub struct Fetch {
 pub struct ExpertCache {
     layouts: HashMap<usize, LayerLayout>,
     classes: Vec<Class>,
-    ram_map: HashMap<Key, usize>,
-    vram_map: HashMap<Key, usize>,
-    freq: HashMap<Key, (f32, u64)>, // decayed frequency, last use (token clock)
-    prior: HashMap<Key, f32>,
-    protect: HashSet<Key>,
+    ram_map: KeyMap<usize>,
+    vram_map: KeyMap<usize>,
+    freq: KeyMap<(f32, u64)>, // decayed frequency, last use (token clock)
+    prior: KeyMap<f32>,
+    protect: KeySet,
     loading: HashMap<u64, (usize, usize, u8)>, // request id -> (class, ram slot, extents left)
     prefetch_ids: HashSet<u64>,
     pub prefetch_k: usize,
@@ -312,11 +391,11 @@ impl ExpertCache {
         let mut me = Self {
             layouts,
             classes,
-            ram_map: HashMap::new(),
-            vram_map: HashMap::new(),
-            freq: HashMap::new(),
-            prior: HashMap::new(),
-            protect: HashSet::new(),
+            ram_map: KeyMap::new(n_expert),
+            vram_map: KeyMap::new(n_expert),
+            freq: KeyMap::new(n_expert),
+            prior: KeyMap::new(n_expert),
+            protect: KeySet::new(n_expert),
             loading: HashMap::new(),
             prefetch_ids: HashSet::new(),
             prefetch_k: cfg.prefetch,
@@ -409,9 +488,10 @@ impl ExpertCache {
     fn touch(&mut self, k: Key) {
         let now = self.now;
         let decay = self.decay;
-        let e = self.freq.entry(k).or_insert((0.0, now));
-        e.0 = e.0 * decay.powi((now - e.1).min(1 << 20) as i32) + 1.0;
-        e.1 = now;
+        if let Some(e) = self.freq.get_or_insert(k, (0.0, now)) {
+            e.0 = e.0 * decay.powi((now - e.1).min(1 << 20) as i32) + 1.0;
+            e.1 = now;
+        }
         *self.counts.entry(k).or_insert(0) += 1;
     }
 
@@ -445,6 +525,35 @@ impl ExpertCache {
 
     /// Pick a RAM slot to (re)use in class `c`; None if every slot is busy.
     fn evict_ram(&mut self, c: usize) -> Option<usize> {
+        // fast path: best candidate by score; its H2D copy has almost always finished long ago
+        let mut best: Option<(usize, bool, f32)> = None;
+        for (i, s) in self.classes[c].ram.iter().enumerate() {
+            match s.state {
+                RState::Loading(_) => continue,
+                RState::Free => return Some(i),
+                RState::Ready => {}
+            }
+            let k = s.key.unwrap();
+            let dup = self.vram_map.contains_key(&k);
+            if self.protect.contains(&k) && !dup {
+                continue;
+            }
+            let sc = self.score(k);
+            if best.is_none_or(|(_, bdup, bsc)| (dup && !bdup) || (dup == bdup && sc < bsc)) {
+                best = Some((i, dup, sc));
+            }
+        }
+        if let Some((i, _, _)) = best {
+            if self.classes[c].ram[i].h2d.done() {
+                let k = self.classes[c].ram[i].key.take().unwrap();
+                self.ram_map.remove(&k);
+                self.classes[c].ram[i].state = RState::Free;
+                return Some(i);
+            }
+        }
+        self.evict_ram_slow(c)
+    }
+    fn evict_ram_slow(&mut self, c: usize) -> Option<usize> {
         let mut best: Option<(usize, bool, f32)> = None;
         let mut blocked: Option<usize> = None; // evictable once its H2D copy finishes
         for (i, s) in self.classes[c].ram.iter().enumerate() {
@@ -679,9 +788,54 @@ impl ExpertCache {
         }
     }
 
+    /// Every expert of the fetch that is on the GPU now (or will be, in stream order), up to
+    /// `max`; blocks only when none is. Empty when the fetch is complete.
+    pub fn next_batch(&mut self, f: &mut Fetch, copy: &Stream, compute: &Stream, max: usize) -> Result<Vec<(u16, ExpertPtrs)>> {
+        let layer = f.layer;
+        let c = self.layouts[&layer].class;
+        let mut out = Vec::new();
+        while out.len() < max {
+            let Some(e) = f.vram.pop_front() else { break };
+            let k = (layer as u16, e);
+            let s = &self.classes[c].vram[self.vram_map[&k]];
+            compute.wait(&s.copy_done)?;
+            // stays protected until done_with: a later upload in this batch must not evict it
+            out.push((e, self.ptrs(layer, e, s.ptr)));
+        }
+        loop {
+            while let Some(id) = self.complete_one(false)? {
+                if let Some(i) = f.waiting.iter().position(|w| w.1 == id) {
+                    let (e, _) = f.waiting.swap_remove(i);
+                    f.ram.push_back(e);
+                }
+            }
+            while out.len() < max {
+                let Some(e) = f.ram.pop_front() else { break };
+                let p = self.upload(layer, e, copy, compute)?;
+                out.push((e, p));
+                self.pump(f);
+            }
+            if !out.is_empty() || (f.waiting.is_empty() && f.to_read.is_empty() && f.ram.is_empty()) {
+                return Ok(out);
+            }
+            if f.waiting.is_empty() {
+                self.pump(f);
+                if f.waiting.is_empty() {
+                    bail!("expert cache deadlock: no RAM slot can be freed (RAM budget too small?)");
+                }
+            }
+            let id = self.complete_one(true)?.unwrap();
+            if let Some(i) = f.waiting.iter().position(|w| w.1 == id) {
+                let (e, _) = f.waiting.swap_remove(i);
+                f.ram.push_back(e);
+            }
+        }
+    }
+
     /// The compute stream finished enqueuing work on `e`; its VRAM slot may be reused after that.
     pub fn done_with(&mut self, layer: usize, e: u16, compute: &Stream) -> Result<()> {
         let k = (layer as u16, e);
+        self.protect.remove(&k);
         if let Some(&v) = self.vram_map.get(&k) {
             let c = self.layouts[&layer].class;
             self.classes[c].vram[v].last_use.record(compute)?;

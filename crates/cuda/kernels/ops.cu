@@ -343,10 +343,77 @@ __global__ void __launch_bounds__(D) k_kda_scan(float *S, const float *q, const 
 #pragma unroll
     for (int i = 0; i < D; i++) Sh[i * D + j] = s[i];
 }
+// Same recurrence for a few tokens (decode / MTP verify): the columns of a head's state are
+// independent, so a head is split over D/32 blocks of 32 columns, and each block's 8 warps own
+// D/8 rows each (coalesced 128-byte row segments); the two dot products over rows (k.S and q.S)
+// are reduced through shared memory. 256 blocks instead of 64, 16 state values per thread.
+template <int D>
+__global__ void __launch_bounds__(256) k_kda_step(float *S, const float *q, const float *k, const float *v, const float *g,
+                                                 const float *beta_logit, float *out, int T, int H, int save_at,
+                                                 float *S_save) {
+    constexpr int RG = 8, RPT = D / RG;
+    const int h = blockIdx.x, lane = threadIdx.x & 31, r = threadIdx.x >> 5;
+    const int j = blockIdx.y * 32 + lane, i0 = r * RPT;
+    __shared__ float sq[D], sk[D], sg[D], red[RG][32];
+    float s[RPT];
+    float *Sh = S + (int64_t) h * D * D;
+#pragma unroll
+    for (int ii = 0; ii < RPT; ii++) s[ii] = Sh[(i0 + ii) * D + j];
+    for (int t = 0; t < T; t++) {
+        const int64_t base = ((int64_t) t * H + h) * D;
+        __syncthreads();
+        if (threadIdx.x < D) {
+            sq[threadIdx.x] = q[base + threadIdx.x];
+            sk[threadIdx.x] = k[base + threadIdx.x];
+            sg[threadIdx.x] = expf(g[base + threadIdx.x]);
+        }
+        const float vj = v[base + j]; // read before `out` (may alias v) is written below
+        __syncthreads();
+        float kv = 0.f;
+#pragma unroll
+        for (int ii = 0; ii < RPT; ii++) {
+            s[ii] *= sg[i0 + ii];
+            kv += s[ii] * sk[i0 + ii];
+        }
+        red[r][lane] = kv;
+        __syncthreads();
+        kv = 0.f;
+#pragma unroll
+        for (int x = 0; x < RG; x++) kv += red[x][lane];
+        const float delta = (vj - kv) * sigmoidf(beta_logit[(int64_t) t * H + h]);
+        float o = 0.f;
+#pragma unroll
+        for (int ii = 0; ii < RPT; ii++) {
+            s[ii] += sk[i0 + ii] * delta;
+            o += s[ii] * sq[i0 + ii];
+        }
+        __syncthreads(); // everyone has read red (kv) before it is reused
+        red[r][lane] = o;
+        __syncthreads();
+        if (r == 0) {
+            o = 0.f;
+#pragma unroll
+            for (int x = 0; x < RG; x++) o += red[x][lane];
+            out[base + j] = o;
+        }
+        if (t == save_at) {
+            float *Ss = S_save + (int64_t) h * D * D;
+#pragma unroll
+            for (int ii = 0; ii < RPT; ii++) Ss[(i0 + ii) * D + j] = s[ii];
+        }
+    }
+#pragma unroll
+    for (int ii = 0; ii < RPT; ii++) Sh[(i0 + ii) * D + j] = s[ii];
+}
+
 GS_EXPORT int gs_kda_scan(float *S, const float *q, const float *k, const float *v, const float *g, const float *beta_logit,
                           float *out, int T, int H, int D, int save_at, float *S_save, void *s) {
     if (D != 128) return (int) cudaErrorInvalidValue;
-    k_kda_scan<128><<<H, 128, 0, (cudaStream_t) s>>>(S, q, k, v, g, beta_logit, out, T, H, save_at, S_save);
+    if (T <= 4) {
+        k_kda_step<128><<<dim3(H, 128 / 32), 256, 0, (cudaStream_t) s>>>(S, q, k, v, g, beta_logit, out, T, H, save_at, S_save);
+    } else {
+        k_kda_scan<128><<<H, 128, 0, (cudaStream_t) s>>>(S, q, k, v, g, beta_logit, out, T, H, save_at, S_save);
+    }
     return (int) cudaGetLastError();
 }
 

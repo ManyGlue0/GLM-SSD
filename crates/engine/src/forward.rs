@@ -141,6 +141,12 @@ pub struct Timings {
     pub tokens: usize,
     pub total: Duration,
     pub moe: Duration,
+    /// MoE: router GEMV + download + sync (drains the GPU queue), incl. the prefetch router
+    pub router: Duration,
+    /// MoE: inside ExpertCache::next (SSD waits, upload calls, bookkeeping)
+    pub next: Duration,
+    /// MoE: enqueueing the expert kernels
+    pub launch: Duration,
 }
 
 pub struct EngineOpts {
@@ -227,6 +233,8 @@ pub struct Engine {
     pub timings: Timings,
     pub cache_aware: f32,
     pub swaps: u64,
+    /// decode: per-expert kernels instead of the fused MoE kernels (GLMSSD_UNFUSED=1, for A/B)
+    unfused: bool,
     // per-call position of the first row (for MLA / indexer), and the layer being run
     p0: usize,
 
@@ -495,6 +503,7 @@ impl Engine {
             timings: Timings::default(),
             cache_aware: o.cache_aware,
             swaps: 0,
+            unfused: std::env::var("GLMSSD_UNFUSED").is_ok_and(|v| v == "1"),
             p0: 0,
             experts: {
                 // whatever the budget leaves after weights, caches and scratch goes to experts
@@ -924,10 +933,20 @@ impl Engine {
             Some(Ffn::Moe { router, bias, .. }) if il + 1 < self.cfg.n_layer => Some((*router, bias.clone())),
             _ => None,
         };
+        // this layer's router and (decode) the next layer's on the same input, for the speculative
+        // prefetch: both land in `self.router` and come back with ONE download + sync
+        let pk = self.experts.prefetch_k;
+        let next_router = next_router.filter(|_| t <= 2 && pk > 0 && 2 * t <= self.chunk);
+        let t_r = Instant::now();
         self.mm(&router, xn, self.router.f32(), t)?;
-        let mut logits = vec![0f32; t * ne];
+        if let Some((r2, _)) = &next_router {
+            self.mm(r2, xn, self.router.f32().wrapping_add(t * ne), t)?;
+        }
+        let mut logits = vec![0f32; if next_router.is_some() { 2 } else { 1 } * t * ne];
         self.router.download(0, bytes_of_mut(&mut logits), &self.s)?;
         self.s.sync()?;
+        self.timings.router += t_r.elapsed();
+        let l2 = logits.split_off(t * ne);
         let routes = self.route_cached(il, &bias, &logits, t);
         if self.trace {
             let r = &routes[t - 1];
@@ -962,12 +981,7 @@ impl Engine {
         }
 
         // speculative prefetch for the next MoE layer during decode
-        let pk = self.experts.prefetch_k;
-        if let Some((r2, b2)) = next_router.filter(|_| t <= 2 && pk > 0) {
-            self.mm(&r2, xn, self.router.f32(), t)?;
-            let mut l2 = vec![0f32; t * ne];
-            self.router.download(0, bytes_of_mut(&mut l2), &self.s)?;
-            self.s.sync()?;
+        if let Some((_, b2)) = next_router {
             let mut guess: Vec<u16> = self.route(&b2, &l2, t).into_iter().flat_map(|r| r.into_iter().take(pk)).map(|x| x.0).collect();
             guess.sort_unstable();
             guess.dedup();
@@ -981,10 +995,45 @@ impl Engine {
         self.moe_acc.zero(&self.s)?;
         let lim = self.layers[il].clamp_exp;
         let parts = self.exp_dims[il].context("no expert tensors")?;
-        while let Some((e, p)) = self.experts.next(&mut fetch, &self.copy, &self.s)? {
+        // decode: fused kernels over batches of ready experts (2 launches per batch)
+        let fused = t == 1 && !self.unfused && self.chunk >= cuda::MOE_MAX;
+        while fused {
+            let t_n = Instant::now();
+            let batch = self.experts.next_batch(&mut fetch, &self.copy, &self.s, cuda::MOE_MAX)?;
+            let t_l = Instant::now();
+            self.timings.next += t_l - t_n;
+            if batch.is_empty() {
+                break;
+            }
+            let mut b = cuda::MoeBatch { n: batch.len() as i32, ..Default::default() };
+            for (i, (e, p)) in batch.iter().enumerate() {
+                b.gate[i] = p.gate;
+                b.up[i] = p.up;
+                b.down[i] = p.down;
+                b.w[i] = groups[*e as usize][0].1;
+            }
+            let [wg, _, wd] = &parts;
+            ck!(ffi::gs_moe_gateup(
+                wg.ty.id() as i32, &b, wg.row_bytes as i64, wg.d0 as i32, wg.d1 as i32, xn, self.eg.f32(), lim, self.s.raw()
+            ));
+            ck!(ffi::gs_moe_down(
+                wd.ty.id() as i32, &b, wd.row_bytes as i64, wd.d0 as i32, wd.d1 as i32, self.eg.f32(), self.moe_acc.f32(),
+                self.s.raw()
+            ));
+            for (e, _) in &batch {
+                self.experts.done_with(il, *e, &self.s)?;
+            }
+            self.timings.launch += t_l.elapsed();
+        }
+        while !fused {
+            let t_n = Instant::now();
+            let Some((e, p)) = self.experts.next(&mut fetch, &self.copy, &self.s)? else { break };
+            let t_l = Instant::now();
+            self.timings.next += t_l - t_n;
             let g = &groups[e as usize];
             self.run_expert(il, &parts, p, g, offs[e as usize], lim, t)?;
             self.experts.done_with(il, e, &self.s)?;
+            self.timings.launch += t_l.elapsed();
         }
         self.dbg("ffn_moe_out", il as isize, self.moe_acc.f32(), n, t)?;
         ck!(ffi::gs_axpy(self.out.f32(), self.moe_acc.f32(), 1.0, (t * n) as i64, self.s.raw()));

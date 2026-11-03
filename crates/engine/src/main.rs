@@ -556,6 +556,7 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
     let prompt_time = t0.elapsed();
     eprintln!("prefill: {}", eng.experts.summary());
     let mut out = Vec::new();
+    let (tm0, st0) = (eng.timings.clone(), eng.experts.stats.clone());
     let t1 = std::time::Instant::now();
     for _ in 0..n_predict {
         let l = &logits;
@@ -586,6 +587,22 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
         eng.timings.moe.as_secs_f64()
     );
     println!("{}", eng.experts.summary());
+    if !out.is_empty() {
+        let (tm, st) = (&eng.timings, &eng.experts.stats);
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / out.len() as f64;
+        let wait = st.read_time - st0.read_time;
+        println!(
+            "decode ms/token: total {:.1} = MoE {:.1} (router sync {:.1}, expert fetch {:.1} of which SSD wait {:.1},              expert launches {:.1}, rest {:.1}) + non-MoE {:.1}",
+            ms(gen_time),
+            ms(tm.moe - tm0.moe),
+            ms(tm.router - tm0.router),
+            ms(tm.next - tm0.next),
+            ms(wait),
+            ms(tm.launch - tm0.launch),
+            ms((tm.moe - tm0.moe).saturating_sub((tm.router - tm0.router) + (tm.next - tm0.next) + (tm.launch - tm0.launch))),
+            ms(gen_time.saturating_sub(tm.moe - tm0.moe)),
+        );
+    }
     eng.experts.save_profile()?;
     Ok(())
 }
