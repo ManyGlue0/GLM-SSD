@@ -103,6 +103,11 @@ The server supports streaming (`reasoning_content` and `content` deltas), tools 
 mapped to GLM's `<tool_call>` XML), `reasoning_effort`, `stop`, and `stream_options.include_usage`.
 Requests are served one at a time; consecutive requests that share a prefix (multi-turn chats,
 agent loops) reuse it: only the new tokens are processed (`usage.prompt_tokens_details.cached_tokens`).
+For that, the client must resend the earlier parts of a chat unchanged: anything that changes
+near the start (e.g. the current time in the system prompt, or a different `reasoning_effort`)
+makes the whole conversation be read again. The server logs where a request stops matching the
+cached conversation (`(prompt cache: request differs ... at token N ...)`) with the text on both
+sides. Put per-turn information such as the time in the newest user message instead.
 
 Time to first token is the prefill of the new tokens. Every token routes to 8 of 288 experts
 per layer, so even a short new message reads several GB from the SSD (~2 s for a 10-token
