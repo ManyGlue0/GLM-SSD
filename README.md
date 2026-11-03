@@ -47,8 +47,24 @@ folder, or just at its name inside `models/`:
 
 ```
 glm-ssd chat -m owner--name --vram-budget 22G --ram-budget 12G
-``` Private/gated repos: set `HF_TOKEN`. Each model
-keeps its own hot-expert profile (`hot-experts.txt` next to it) unless `--profile` is given.
+```
+
+Private/gated repos: set `HF_TOKEN`. Each model keeps its own hot-expert profile
+(`hot-experts.txt` next to it) unless `--profile` is given.
+
+### Repack the experts (recommended, once per model)
+
+```
+glm-ssd repack                 # the default model; -m for another one
+```
+
+This writes `<model>.glm-ssd-experts` next to the GGUF: every expert as one 4 KiB-aligned block,
+so loading an expert from the SSD is one read instead of three. It takes ~95 GB of disk and about
+a minute; decode gets ~11% faster and a fresh prompt's first token arrives sooner. The engine
+uses the file automatically while it matches the model (the start-up line says
+`experts from the repacked file`). If the file is deleted, or stale because the model changed,
+the engine reads the GGUF as before; run `glm-ssd repack` again to recreate it (`--force`
+rebuilds an up-to-date one).
 
 ## Use
 
@@ -81,6 +97,7 @@ Useful options:
 | `--preload` | fill the expert caches from the learned hot-expert profile at start |
 | `--profile FILE` / `--no-profile` | where usage statistics are kept (default `models/hot-experts.txt`; for another `-m` model, `hot-experts.txt` in its folder) |
 | `--prefetch K` | prefetch K predicted experts of the next layer while decoding (default 2) |
+| `--gguf-experts` | read experts from the GGUF even when a repacked file exists (for comparisons) |
 | `--cache-aware M` | cache-aware routing: an uncached expert of rank 3-8 is replaced by a cached one whose routing score is within M (default 0 = exact). 0.1 = +65% decode speed at unchanged perplexity on our test; 0.2 = +95% at +1.3% perplexity |
 | `--kv-cache q8` | store the context (MLA latents) as Q8: 47% smaller (~0.85 GB saved at 128K), no measurable quality change |
 | `--idle-unload SECS` | chat/serve: after this many idle seconds, free all VRAM and RAM (incl. the CUDA context); the next message/request reloads in ~5 s (default 120, 0 = never). The conversation's prompt cache is parked in a temp file meanwhile, so the conversation continues without being re-read |

@@ -8,6 +8,7 @@ mod model;
 mod plan;
 mod qtest;
 mod refcheck;
+mod repack;
 mod server;
 mod session;
 mod tokenizer;
@@ -179,6 +180,9 @@ struct EngineArgs {
     /// Decode: prefetch this many of the next layer's predicted experts (0 = off)
     #[arg(long, default_value_t = 2)]
     prefetch: usize,
+    /// Read experts from the GGUF even when a repacked file (`glm-ssd repack`) exists
+    #[arg(long)]
+    gguf_experts: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -339,6 +343,16 @@ enum Cmd {
         #[arg(long, default_value_t = 4.0)]
         secs: f64,
     },
+    /// Write the experts into one SSD-friendly file next to the model (one read per expert
+    /// instead of three; ~the size of the model's expert weights). The engine uses it
+    /// automatically while it matches the model; delete it to go back, rerun to recreate it.
+    Repack {
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
+        model: PathBuf,
+        /// Rebuild even if an up-to-date file exists
+        #[arg(long)]
+        force: bool,
+    },
     /// Print model structure and the memory placement plan for the given budgets
     Inspect {
         #[command(flatten)]
@@ -369,6 +383,7 @@ fn main() -> Result<()> {
             None => qtest::run(model.as_deref())?,
         },
         Cmd::Qbench => qtest::bench()?,
+        Cmd::Repack { model, force } => repack::repack(&gguf::Gguf::open(&model)?, force)?,
         Cmd::Iobench { file, mib, secs } => io::bench(&file, (mib * 1048576.0) as usize, secs)?,
         Cmd::Tokenize { model, text } => {
             let g = gguf::Gguf::open_shard(&model)?;
@@ -491,19 +506,21 @@ fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
             io_threads: a.io_threads,
             direct_io: !a.buffered_io,
             profile: if a.no_profile { None } else { Some(profile_path(a)) },
+            use_packed: !a.gguf_experts,
         },
     };
     let t0 = std::time::Instant::now();
     let mut eng = forward::Engine::new(&g, cfg, opts)?;
     let (nv, nr, vb, rb) = eng.experts.capacity();
     eprintln!(
-        "engine ready in {:.1}s: ctx {} | chunk {} | MTP {} | expert cache: {nv} VRAM slots ({:.1} GiB) + {nr} RAM slots ({:.1} GiB)",
+        "engine ready in {:.1}s: ctx {} | chunk {} | MTP {} | expert cache: {nv} VRAM slots ({:.1} GiB) + {nr} RAM slots ({:.1} GiB) | experts from {}",
         t0.elapsed().as_secs_f64(),
         eng.ctx,
         eng.chunk,
         if eng.has_mtp() { "on" } else { "off" },
         plan::gib(vb),
-        plan::gib(rb)
+        plan::gib(rb),
+        if eng.experts.packed_file.is_some() { "the repacked file" } else { "the GGUF (run `glm-ssd repack` for faster reads)" }
     );
     if a.preload {
         eng.preload()?;

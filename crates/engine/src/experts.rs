@@ -11,6 +11,7 @@
 //! the compute stream (the copy stream waits for it before overwriting the slot).
 
 use crate::io::ALIGN;
+use crate::repack::{self, Packed, PackedLayer};
 use anyhow::{anyhow, bail, Context, Result};
 use cuda::{DeviceBuffer, Event, PinnedBuffer, Stream};
 use gguf::{Gguf, TensorInfo};
@@ -43,6 +44,8 @@ struct Part {
 struct LayerLayout {
     parts: [Part; 3],
     class: usize,
+    /// the layer's records in the repacked file (one read per expert)
+    packed: Option<PackedLayer>,
 }
 
 /// Device pointers of one expert's gate / up / down matrices.
@@ -72,7 +75,7 @@ struct IoPool {
     next_id: u64,
 }
 
-fn read_direct(f: &File, off: u64, buf: &mut [u8]) -> std::io::Result<u64> {
+pub(crate) fn read_direct(f: &File, off: u64, buf: &mut [u8]) -> std::io::Result<u64> {
     let mut got = 0usize;
     while got < buf.len() {
         #[cfg(windows)]
@@ -243,6 +246,8 @@ pub struct ExpertCache {
     pub counts: HashMap<Key, u64>,
     profile_path: Option<PathBuf>,
     profile_tokens: u64,
+    /// reader file index of the repacked experts (None: read the GGUF slices)
+    pub packed_file: Option<usize>,
 }
 unsafe impl Send for ExpertCache {}
 
@@ -254,12 +259,15 @@ pub struct CacheConfig {
     pub io_threads: usize,
     pub direct_io: bool,
     pub profile: Option<PathBuf>,
+    /// read experts from the repacked file when a valid one exists
+    pub use_packed: bool,
 }
 
 impl ExpertCache {
     pub fn new(g: &Gguf, moe_layers: &[usize], n_expert: usize, cfg: &CacheConfig) -> Result<Self> {
         // size classes = distinct (gate, up, down) slice sizes
         let mut layouts = HashMap::new();
+        let packed = if cfg.use_packed { Packed::open(g)? } else { None };
         let mut class_sizes: Vec<[u64; 3]> = Vec::new();
         let mut class_layers: Vec<usize> = Vec::new();
         for &il in moe_layers {
@@ -275,17 +283,14 @@ impl ExpertCache {
                 }
             };
             class_layers[class] += 1;
-            let mut region = 0usize;
-            let parts = [0, 1, 2].map(|i| {
-                let p = Part { info: infos[i].clone(), per: pers[i], region };
-                region += (pers[i] as usize).next_multiple_of(ALIGN as usize) + ALIGN as usize;
-                p
-            });
-            layouts.insert(il, LayerLayout { parts, class });
+            let (regions, _) = repack::slot_layout(pers);
+            let parts = [0, 1, 2].map(|i| Part { info: infos[i].clone(), per: pers[i], region: regions[i] });
+            let packed = packed.as_ref().and_then(|p| p.layers.get(&il).copied());
+            layouts.insert(il, LayerLayout { parts, class, packed });
         }
         let slot_bytes: Vec<usize> = class_sizes
             .iter()
-            .map(|c| c.iter().map(|p| (*p as usize).next_multiple_of(ALIGN as usize) + ALIGN as usize).sum())
+            .map(|c| repack::slot_layout(*c).1)
             .collect();
         // split the budgets across classes in proportion to their total expert bytes
         let total: f64 = (0..class_sizes.len()).map(|c| (class_layers[c] * n_expert * slot_bytes[c]) as f64).sum();
@@ -297,7 +302,13 @@ impl ExpertCache {
             let n_r = (((cfg.ram_bytes as f64 * share) as usize) / slot_bytes[c]).clamp(MIN_SLOTS, cap);
             classes.push(Self::alloc_class(slot_bytes[c], n_v, n_r)?);
         }
-        let io = IoPool::new(&g.shards, cfg.io_threads.max(1), cfg.direct_io)?;
+        // the packed file is reader "shard" index g.shards.len()
+        let mut files = g.shards.clone();
+        let packed_file = packed.as_ref().map(|p| {
+            files.push(p.path.clone());
+            files.len() - 1
+        });
+        let io = IoPool::new(&files, cfg.io_threads.max(1), cfg.direct_io)?;
         let mut me = Self {
             layouts,
             classes,
@@ -316,6 +327,7 @@ impl ExpertCache {
             counts: HashMap::new(),
             profile_path: cfg.profile.clone(),
             profile_tokens: 0,
+            packed_file,
         };
         if let Some(p) = &cfg.profile {
             if p.exists() {
@@ -405,6 +417,10 @@ impl ExpertCache {
 
     fn reads_for(&self, layer: usize, e: u16, dst: *mut u8) -> Vec<(usize, u64, usize, usize)> {
         let lay = &self.layouts[&layer];
+        if let (Some(pl), Some(fi)) = (lay.packed, self.packed_file) {
+            let per = [0, 1, 2].map(|i| lay.parts[i].per);
+            return vec![(fi, pl.offset + e as u64 * pl.stride, repack::record_len(per), dst as usize)];
+        }
         lay.parts
             .iter()
             .map(|p| {
@@ -417,10 +433,12 @@ impl ExpertCache {
     }
     fn ptrs(&self, layer: usize, e: u16, base: *const u8) -> ExpertPtrs {
         let lay = &self.layouts[&layer];
+        let packed = lay.packed.is_some() && self.packed_file.is_some();
         let p = |i: usize| {
             let part = &lay.parts[i];
             let off = part.info.offset + e as u64 * part.per;
-            unsafe { base.add(part.region + (off % ALIGN) as usize) }
+            let skip = if packed { 0 } else { (off % ALIGN) as usize };
+            unsafe { base.add(part.region + skip) }
         };
         ExpertPtrs { gate: p(0), up: p(1), down: p(2) }
     }
@@ -491,13 +509,14 @@ impl ExpertCache {
         let k = (layer as u16, e);
         let dst = self.classes[c].ram[slot].ptr;
         let reads = self.reads_for(layer, e, dst);
+        let n_reads = reads.len() as u8;
         let id = self.io.submit(reads, hi);
         let s = &mut self.classes[c].ram[slot];
         s.key = Some(k);
         s.state = RState::Loading(id);
         s.prefetched = !hi;
         self.ram_map.insert(k, slot);
-        self.loading.insert(id, (c, slot, 3));
+        self.loading.insert(id, (c, slot, n_reads));
         if !hi {
             self.prefetch_ids.insert(id);
             self.stats.prefetch_issued += 1;
@@ -728,13 +747,14 @@ impl ExpertCache {
                 let slot = self.evict_ram(c).context("preload: no RAM slot")?;
                 let dst = self.classes[c].ram[slot].ptr;
                 let reads = self.reads_for(k.0 as usize, k.1, dst);
+                let n_reads = reads.len() as u8;
                 let id = self.io.submit(reads, true);
                 let s = &mut self.classes[c].ram[slot];
                 s.key = Some(*k);
                 s.state = RState::Loading(id);
                 s.prefetched = false;
                 self.ram_map.insert(*k, slot);
-                self.loading.insert(id, (c, slot, 3));
+                self.loading.insert(id, (c, slot, n_reads));
                 self.protect.insert(*k);
             }
             for _ in chunk {
