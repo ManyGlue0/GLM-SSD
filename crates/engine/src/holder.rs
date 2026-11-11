@@ -30,7 +30,6 @@ impl State {
 pub struct ModelHolder {
     load: Box<dyn Fn() -> Result<Session> + Send + Sync>,
     state: Mutex<State>,
-    idle: Option<Duration>,
 }
 
 const PARK_PREFIX: &str = "glm-ssd-session-";
@@ -55,7 +54,7 @@ impl ModelHolder {
     /// `idle`: unload after this long without use (None = never).
     pub fn new(load: impl Fn() -> Result<Session> + Send + Sync + 'static, idle: Option<Duration>) -> Arc<Self> {
         clean_stale();
-        let h = Arc::new(Self { load: Box::new(load), state: Mutex::new(State { session: None, last: Instant::now(), saved: None }), idle });
+        let h = Arc::new(Self { load: Box::new(load), state: Mutex::new(State { session: None, last: Instant::now(), saved: None }) });
         if let Some(d) = idle {
             let w = Arc::downgrade(&h);
             std::thread::Builder::new()

@@ -41,7 +41,6 @@ pub fn is_expert_tensor(name: &str) -> bool {
 pub struct Weights {
     _buf: DeviceBuffer,
     map: HashMap<String, DTensor>,
-    pub bytes: usize,
 }
 
 pub fn read_at(f: &File, mut off: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
@@ -100,7 +99,7 @@ impl Weights {
             total as f64 / (1u64 << 30) as f64,
             t0.elapsed().as_secs_f64()
         );
-        Ok(Self { _buf: buf, map, bytes: total })
+        Ok(Self { _buf: buf, map })
     }
 
     pub fn get(&self, name: &str) -> Result<DTensor> {
@@ -123,22 +122,4 @@ pub fn read_f32(g: &Gguf, files: &[File], name: &str) -> Result<Vec<f32>> {
     let mut raw = vec![0u8; t.n_bytes as usize];
     read_at(&files[t.shard], t.offset, &mut raw)?;
     Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
-}
-
-/// Per-layer expert tensor locations (for direct reads of single experts).
-#[derive(Clone, Debug)]
-pub struct ExpertTensors {
-    pub gate: TensorInfo,
-    pub up: TensorInfo,
-    pub down: TensorInfo,
-}
-
-impl ExpertTensors {
-    pub fn for_layer(g: &Gguf, il: usize) -> Result<Self> {
-        let get = |n: &str| g.tensor(&format!("blk.{il}.{n}")).cloned().with_context(|| format!("blk.{il}.{n} missing"));
-        Ok(Self { gate: get("ffn_gate_exps.weight")?, up: get("ffn_up_exps.weight")?, down: get("ffn_down_exps.weight")? })
-    }
-    pub fn unit_bytes(&self) -> usize {
-        [&self.gate, &self.up, &self.down].iter().map(|t| (t.n_bytes / t.dims[2]) as usize).sum()
-    }
 }

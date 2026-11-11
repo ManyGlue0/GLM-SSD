@@ -191,9 +191,6 @@ pub struct Snapshot {
     data: Vec<Vec<u8>>,
 }
 impl Snapshot {
-    pub fn bytes(&self) -> usize {
-        self.data.iter().map(Vec::len).sum()
-    }
     pub fn write_to(&self, w: &mut impl Write) -> Result<()> {
         for v in [self.pos, self.mtp_pos, self.pend_n, self.data.len()] {
             put_u64(w, v as u64)?;

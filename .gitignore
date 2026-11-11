@@ -8,3 +8,5 @@ download.log
 /.claude/settings.local.json
 /hot-experts.txt
 /hot-experts.tmp
+/NOTES.md
+/DESIGN.md

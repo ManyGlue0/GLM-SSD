@@ -20,7 +20,6 @@ pub struct Config {
     pub n_head: usize,
     pub attn: Vec<AttnKind>, // per layer, incl. MTP layers
     pub rms_eps: f32,
-    pub norm_eps: f32,
 
     // FFN / MoE
     pub n_ff: usize,
@@ -57,7 +56,6 @@ pub struct Config {
     pub hc_eps: f32,
 
     // tokens
-    pub bos: Option<u32>,
     pub eos: Vec<u32>,
 }
 
@@ -104,7 +102,6 @@ impl Config {
             n_head: u("attention.head_count")?,
             attn,
             rms_eps: f("attention.layer_norm_rms_epsilon")?,
-            norm_eps: f("attention.layer_norm_epsilon").unwrap_or(1e-6),
             n_ff: u("feed_forward_length")?,
             n_ff_exp: u("expert_feed_forward_length")?,
             n_expert: u("expert_count")?,
@@ -129,7 +126,6 @@ impl Config {
             hc: u("hyper_connection.count")?,
             hc_sinkhorn_iters: u("hyper_connection.sinkhorn_iterations")?,
             hc_eps: f("hyper_connection.epsilon")?,
-            bos: tok("bos_token_id"),
             eos,
         })
     }

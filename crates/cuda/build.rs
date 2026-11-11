@@ -5,8 +5,16 @@ fn main() {
         .or_else(|_| std::env::var("CUDA_HOME"))
         .expect("CUDA_PATH not set (install the CUDA toolkit)");
     let cuda = PathBuf::from(cuda);
-    // Target GPU arch; override with GLMSSD_CUDA_ARCH=sm_89 etc.
-    let arch = std::env::var("GLMSSD_CUDA_ARCH").unwrap_or_else(|_| "sm_86".into());
+    // Target GPU architecture(s). Default "native": the GPU(s) in this machine. GLMSSD_CUDA_ARCH
+    // takes one arch or a comma list, e.g. "sm_89" or "80,86,89,120"; with a list, the last one
+    // is also embedded as PTX so newer GPUs can JIT it (release builds).
+    // Ampere (sm_80) or newer: the attention kernel needs >64 KB of shared memory per block.
+    let arch = std::env::var("GLMSSD_CUDA_ARCH").unwrap_or_else(|_| "native".into());
+    let archs: Vec<String> = arch
+        .split(',')
+        .map(|a| a.trim().trim_start_matches("sm_").trim_start_matches("compute_").to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
 
     let kernels: Vec<PathBuf> = std::fs::read_dir("kernels")
         .expect("kernels dir")
@@ -27,13 +35,22 @@ fn main() {
     b.cargo_warnings(false);
     b.cuda(true)
         .cudart("static")
-        .flag(format!("-arch={arch}"))
         .flag("-O3")
         .flag("--use_fast_math")
         .flag("-std=c++20")
         .flag("-lineinfo")
         .flag("-Xcompiler=/MD") // match Rust's MSVC CRT
         .include("kernels");
+    if archs.len() == 1 {
+        let a = &archs[0];
+        b.flag(if a == "native" || a.starts_with("all") { format!("-arch={a}") } else { format!("-arch=sm_{a}") });
+    } else {
+        for a in &archs {
+            b.flag(format!("-gencode=arch=compute_{a},code=sm_{a}"));
+        }
+        let last = archs.last().expect("GLMSSD_CUDA_ARCH");
+        b.flag(format!("-gencode=arch=compute_{last},code=compute_{last}"));
+    }
     for k in &kernels {
         b.file(k);
     }

@@ -11,6 +11,28 @@ use std::path::Path;
 
 pub const ALIGN: u64 = 4096;
 
+/// Physical RAM available right now (Windows: GlobalMemoryStatusEx).
+pub fn available_ram() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        len: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_ext_virtual: u64,
+    }
+    extern "system" {
+        fn GlobalMemoryStatusEx(m: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m: MemoryStatusEx = unsafe { std::mem::zeroed() };
+    m.len = std::mem::size_of::<MemoryStatusEx>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.avail_phys)
+}
+
 pub fn open_direct(path: &Path) -> Result<File> {
     let mut o = OpenOptions::new();
     o.read(true);

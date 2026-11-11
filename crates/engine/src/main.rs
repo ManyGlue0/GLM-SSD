@@ -1,5 +1,6 @@
 mod chat;
 mod config;
+mod download;
 mod experts;
 mod forward;
 mod holder;
@@ -19,22 +20,56 @@ use serde_json::{json, Value as Json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-/// Absolute paths into this repository, so the installed binary works from any folder
-/// (override with -m / GLMSSD_MODEL and --profile).
-const DEFAULT_MODEL: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf");
-const DEFAULT_PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/hot-experts.txt");
-const MODELS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models");
+/// The official model (`glm-ssd download` with no arguments), relative to the models folder.
+const OFFICIAL_MODEL: &str = "UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf";
+
+/// Where models live: GLMSSD_MODELS if set, else a `models` folder next to the executable
+/// (release zips), else, for builds from source, the repository's `models` folder (so an
+/// installed binary finds them from any working directory).
+fn models_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Some(d) = std::env::var_os("GLMSSD_MODELS").filter(|d| !d.is_empty()) {
+            return d.into();
+        }
+        let beside_exe = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("models")));
+        if let Some(d) = beside_exe.as_ref().filter(|d| d.is_dir()) {
+            return d.clone();
+        }
+        // release builds set GLMSSD_PORTABLE: the build machine's paths mean nothing elsewhere
+        if option_env!("GLMSSD_PORTABLE").is_none() {
+            if let Some(repo) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2) {
+                return repo.join("models");
+            }
+        }
+        beside_exe.unwrap_or_else(|| PathBuf::from("models"))
+    })
+}
+
+/// Default `-m`: the official model if present, else the models folder (fine when it holds one
+/// model; otherwise the error lists them).
+fn default_model() -> &'static str {
+    static M: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let official = models_dir().join(OFFICIAL_MODEL);
+        let p = if official.exists() || !models_dir().is_dir() { official } else { models_dir().to_path_buf() };
+        p.display().to_string()
+    })
+}
 
 /// `-m` value: a .gguf file as given; a folder (or a folder name inside models/) -> shard 1 of
 /// the one GGUF model found in it or its subfolders.
 fn model_path(s: &str) -> std::result::Result<PathBuf, String> {
     let p = PathBuf::from(s);
-    let p = if !p.exists() && p.is_relative() && std::path::Path::new(MODELS_DIR).join(&p).exists() {
-        std::path::Path::new(MODELS_DIR).join(&p)
-    } else {
-        p
-    };
+    let p = if !p.exists() && p.is_relative() && models_dir().join(&p).exists() { models_dir().join(&p) } else { p };
+    if !p.exists() {
+        return Err(format!(
+            "{} not found. Download the model first with `glm-ssd download`, or pass -m <model folder or .gguf> \
+             (models are looked up in {}; set GLMSSD_MODELS to use another folder)",
+            p.display(),
+            models_dir().display()
+        ));
+    }
     if !p.is_dir() {
         return Ok(p);
     }
@@ -95,7 +130,7 @@ struct Cli {
 #[derive(clap::Args, Clone)]
 struct ModelArgs {
     /// The model: its folder (also a folder name inside models/), or any shard of it
-    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
+    #[arg(short, long, env = "GLMSSD_MODEL", default_value = default_model(), value_parser = model_path)]
     model: PathBuf,
     /// Parse headers only (works on truncated shards, for inspection before download completes)
     #[arg(long)]
@@ -104,12 +139,12 @@ struct ModelArgs {
 
 #[derive(clap::Args, Clone)]
 struct BudgetArgs {
-    /// VRAM the engine may use (e.g. 22G). G = GiB.
+    /// VRAM the engine may use (e.g. 22G; G = GiB). Default: the free VRAM minus 0.75 GiB
     #[arg(long)]
-    vram_budget: String,
-    /// RAM the engine may use (e.g. 24G)
+    vram_budget: Option<String>,
+    /// RAM the engine may use (e.g. 16G). Default: 2/3 of the available RAM
     #[arg(long)]
-    ram_budget: String,
+    ram_budget: Option<String>,
     /// Max context length (tokens)
     #[arg(long, default_value_t = 65536)]
     ctx: usize,
@@ -125,14 +160,16 @@ struct BudgetArgs {
 #[derive(clap::Args, Clone)]
 struct EngineArgs {
     /// The model: its folder (also a folder name inside models/), or any shard of it
-    #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
+    #[arg(short, long, env = "GLMSSD_MODEL", default_value = default_model(), value_parser = model_path)]
     model: PathBuf,
-    /// Total VRAM the engine may use: weights + caches + scratch; the rest becomes the expert cache (e.g. 22G)
+    /// Total VRAM the engine may use: weights + caches + scratch; the rest becomes the expert
+    /// cache (e.g. 22G; G = GiB). Default: the free VRAM minus 0.75 GiB
     #[arg(long)]
-    vram_budget: String,
-    /// RAM for the pinned expert cache + prompt-cache snapshots (e.g. 16G)
+    vram_budget: Option<String>,
+    /// RAM for the pinned expert cache + prompt-cache snapshots (e.g. 16G). Default: 2/3 of the
+    /// available RAM
     #[arg(long)]
-    ram_budget: String,
+    ram_budget: Option<String>,
     /// Max context length (tokens)
     #[arg(long, default_value_t = 32768)]
     ctx: usize,
@@ -151,7 +188,7 @@ struct EngineArgs {
     #[arg(long, default_value_t = 8)]
     io_threads: usize,
     /// Learned hot-expert profile (read at start for cache priorities, updated on exit).
-    /// Default: models/hot-experts.txt for the default model, hot-experts.txt next to any other
+    /// Default: hot-experts.txt in the models folder for the official model, next to any other
     #[arg(long)]
     profile: Option<PathBuf>,
     /// Don't read or write the hot-expert profile
@@ -208,9 +245,15 @@ impl SampleArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Download a model from Hugging Face (default: the official GLM-5.3-Flash UD-IQ2_XXS, ~102 GB)
+    /// into the models folder. Resumable: rerun it after an interruption.
+    #[command(display_order = 0)]
+    Download(download::DownloadArgs),
     /// Show GPU info and run a CUDA smoke test
+    #[command(display_order = 5)]
     Gpu,
     /// Cross-check CUDA quant kernels against the CPU reference
+    #[command(display_order = 12)]
     Qtest {
         /// Also test real tensors from this (fully downloaded) model
         #[arg(short, long)]
@@ -220,8 +263,10 @@ enum Cmd {
         ref_dir: Option<PathBuf>,
     },
     /// Benchmark the quantized GEMV / GEMM kernels
+    #[command(display_order = 13)]
     Qbench,
     /// Run a prompt (token ids or text) through the model with greedy decoding (validation)
+    #[command(display_order = 8)]
     Run {
         #[command(flatten)]
         eng: EngineArgs,
@@ -248,6 +293,7 @@ enum Cmd {
         top: usize,
     },
     /// Interactive chat in the terminal
+    #[command(display_order = 2)]
     Chat {
         #[command(flatten)]
         eng: EngineArgs,
@@ -268,6 +314,7 @@ enum Cmd {
         max_output: usize,
     },
     /// OpenAI-compatible HTTP server
+    #[command(display_order = 3)]
     Serve {
         #[command(flatten)]
         eng: EngineArgs,
@@ -288,6 +335,7 @@ enum Cmd {
         no_reasoning_replay: bool,
     },
     /// Decode benchmark: chat prompt -> N generated tokens (greedy), steady-state speed
+    #[command(display_order = 4)]
     Bench {
         #[command(flatten)]
         eng: EngineArgs,
@@ -299,6 +347,7 @@ enum Cmd {
     },
     /// Quality + speed under decode conditions: prefill the first tokens of a text, then feed the
     /// rest one token at a time and report the perplexity of each next token
+    #[command(display_order = 7)]
     Ppl {
         #[command(flatten)]
         eng: EngineArgs,
@@ -313,6 +362,7 @@ enum Cmd {
         n: usize,
     },
     /// f64 CPU reference of layer 0 (KDA + mHC) for one token, to arbitrate GPU vs llama.cpp
+    #[command(display_order = 14)]
     RefL0 {
         #[command(flatten)]
         model: ModelArgs,
@@ -320,20 +370,23 @@ enum Cmd {
         token: u32,
     },
     /// Tokenize text with the model's tokenizer (only needs the first shard)
+    #[command(display_order = 9)]
     Tokenize {
-        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = default_model(), value_parser = model_path)]
         model: PathBuf,
         /// Text to encode; special tokens like <|user|> are parsed
         text: String,
     },
     /// Render a chat with the model's template (messages as JSON) and tokenize it
+    #[command(display_order = 10)]
     Template {
-        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = default_model(), value_parser = model_path)]
         model: PathBuf,
         /// JSON array of messages
         messages: String,
     },
     /// Benchmark direct (unbuffered) random reads of expert-sized blocks from a file
+    #[command(display_order = 11)]
     Iobench {
         file: PathBuf,
         /// Read size in MiB (one expert is ~7.2 MiB)
@@ -346,14 +399,16 @@ enum Cmd {
     /// Write the experts into one SSD-friendly file next to the model (one read per expert
     /// instead of three; ~the size of the model's expert weights). The engine uses it
     /// automatically while it matches the model; delete it to go back, rerun to recreate it.
+    #[command(display_order = 1)]
     Repack {
-        #[arg(short, long, env = "GLMSSD_MODEL", default_value = DEFAULT_MODEL, value_parser = model_path)]
+        #[arg(short, long, env = "GLMSSD_MODEL", default_value = default_model(), value_parser = model_path)]
         model: PathBuf,
         /// Rebuild even if an up-to-date file exists
         #[arg(long)]
         force: bool,
     },
     /// Print model structure and the memory placement plan for the given budgets
+    #[command(display_order = 6)]
     Inspect {
         #[command(flatten)]
         model: ModelArgs,
@@ -366,8 +421,16 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    match &mut cli.cmd {
+        Cmd::Run { eng, .. } | Cmd::Chat { eng, .. } | Cmd::Serve { eng, .. } | Cmd::Bench { eng, .. } | Cmd::Ppl { eng, .. } => {
+            auto_budgets(&mut eng.vram_budget, &mut eng.ram_budget)?
+        }
+        Cmd::Inspect { budget, .. } => auto_budgets(&mut budget.vram_budget, &mut budget.ram_budget)?,
+        _ => {}
+    }
     match cli.cmd {
+        Cmd::Download(args) => download::run(args, models_dir())?,
         Cmd::Gpu => {
             let d = cuda::device_info(0)?;
             println!(
@@ -456,8 +519,8 @@ fn main() -> Result<()> {
                 }
             }
             let b = plan::Budgets {
-                vram: plan::parse_size(&budget.vram_budget)?,
-                ram: plan::parse_size(&budget.ram_budget)?,
+                vram: budget_bytes(&budget.vram_budget)?,
+                ram: budget_bytes(&budget.ram_budget)?,
                 ctx: budget.ctx,
                 workspace: plan::parse_size(&budget.workspace)?,
                 with_mtp: !budget.no_mtp,
@@ -467,6 +530,33 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// --vram-budget / --ram-budget left out: derive them from what is free now. Resolved once at
+/// start, so an idle unload + reload keeps the same budgets.
+fn auto_budgets(vram: &mut Option<String>, ram: &mut Option<String>) -> Result<()> {
+    const STEP: u64 = 1 << 28; // round down to 0.25 GiB
+    let mut auto = Vec::new();
+    if vram.is_none() {
+        let d = cuda::device_info(0).context("no usable CUDA GPU")?;
+        let v = d.free_mem.saturating_sub(768 << 20) / STEP * STEP;
+        auto.push(format!("--vram-budget {:.2}G ({:.2} GiB free on {})", plan::gib(v), plan::gib(d.free_mem), d.name));
+        *vram = Some(v.to_string());
+    }
+    if ram.is_none() {
+        let avail = io::available_ram().context("reading the available RAM (pass --ram-budget)")?;
+        let r = avail / 3 * 2 / STEP * STEP;
+        auto.push(format!("--ram-budget {:.2}G ({:.1} GiB available)", plan::gib(r), plan::gib(avail)));
+        *ram = Some(r.to_string());
+    }
+    if !auto.is_empty() {
+        eprintln!("auto budgets: {} (pass the flags to choose)", auto.join(", "));
+    }
+    Ok(())
+}
+
+fn budget_bytes(b: &Option<String>) -> Result<u64> {
+    plan::parse_size(b.as_deref().context("budget not resolved")?)
 }
 
 /// Each model keeps its own usage statistics: another fine-tune routes differently.
@@ -479,8 +569,8 @@ fn profile_path(a: &EngineArgs) -> PathBuf {
         _ => x == y,
     };
     match a.model.parent() {
-        Some(dir) if !same(&a.model, std::path::Path::new(DEFAULT_MODEL)) => dir.join("hot-experts.txt"),
-        _ => PathBuf::from(DEFAULT_PROFILE),
+        Some(dir) if !same(&a.model, &models_dir().join(OFFICIAL_MODEL)) => dir.join("hot-experts.txt"),
+        _ => models_dir().join("hot-experts.txt"),
     }
 }
 
@@ -488,8 +578,8 @@ fn profile_path(a: &EngineArgs) -> PathBuf {
 fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
     let g = gguf::Gguf::open(&a.model)?;
     let cfg = config::Config::from_gguf(&g)?;
-    let vram = plan::parse_size(&a.vram_budget)?;
-    let ram = plan::parse_size(&a.ram_budget)?;
+    let vram = budget_bytes(&a.vram_budget)?;
+    let ram = budget_bytes(&a.ram_budget)?;
     let snap_bytes = (a.snapshots as u64) * (150 << 20);
     let ram_cache = ram.saturating_sub((1u64 << 30) + snap_bytes);
     let opts = forward::EngineOpts {

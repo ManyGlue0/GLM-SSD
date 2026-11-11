@@ -66,10 +66,6 @@ impl Vocab {
         Ok(Self { tokens, byte_of, char_of, id_of, ranks, specials, re })
     }
 
-    pub fn token_id(&self, s: &str) -> Option<u32> {
-        self.id_of.get(s).copied()
-    }
-
     /// Encode text. With `parse_special`, special-token strings (e.g. `<|user|>`) become their ids.
     pub fn encode(&self, text: &str, parse_special: bool) -> Vec<u32> {
         let mut out = Vec::new();
@@ -145,10 +141,6 @@ impl Vocab {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.tokens.len()
-    }
-
     /// Raw bytes of one token (special tokens like `<|user|>` come back verbatim).
     pub fn token_bytes(&self, id: u32) -> Vec<u8> {
         let Some(t) = self.tokens.get(id as usize) else { return Vec::new() };
@@ -172,7 +164,4 @@ impl Vocab {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    pub fn piece(&self, id: u32) -> &str {
-        self.tokens.get(id as usize).map(String::as_str).unwrap_or("?")
-    }
 }

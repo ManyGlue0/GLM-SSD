@@ -1,4 +1,4 @@
-//! hfdl: download files from a Hugging Face repo as fast as the link allows.
+//! `glm-ssd download`: fetch a model from a Hugging Face repo as fast as the link allows.
 //!
 //! - Splits every file into fixed-size chunks fetched with HTTP Range requests over
 //!   N independent connections (HTTP/1.1, one TCP stream per request).
@@ -8,7 +8,6 @@
 //! - Verifies the LFS SHA-256 of each file as soon as it completes (while others download).
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
 use futures_util::StreamExt;
 use globset::{Glob, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -27,9 +26,8 @@ const DEFAULT_REPO: &str = "unsloth/GLM-5.3-Flash-GGUF";
 const URL_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 const FLUSH_BYTES: usize = 8 << 20;
 
-#[derive(Parser, Debug)]
-#[command(version, about)]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct DownloadArgs {
     /// Repository id (owner/name) or a Hugging Face URL
     #[arg(long, default_value = DEFAULT_REPO)]
     repo: String,
@@ -45,8 +43,8 @@ struct Args {
     /// (or only one IQ2_XXS), otherwise the choices are listed
     #[arg(long)]
     include: Vec<String>,
-    /// Output directory (repo folder structure is preserved inside it). Default: models/ for the
-    /// official repo, models/<owner>--<name>/ for others
+    /// Output directory (repo folder structure is preserved inside it). Default: the models
+    /// folder for the official repo, <models>/<owner>--<name>/ for others
     #[arg(long)]
     out: Option<PathBuf>,
     /// Parallel connections
@@ -104,18 +102,20 @@ struct Chunk {
     idx: usize,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+pub fn run(args: DownloadArgs, models: &Path) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(download(args, models))
+}
+
+async fn download(args: DownloadArgs, models: &Path) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
 
     let api = reqwest::Client::builder()
-        .user_agent("hfdl/0.1")
+        .user_agent(concat!("glm-ssd/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
         .build()?;
     // CDN client: no redirects (we resolve ourselves), many idle connections kept alive.
     let cdn = reqwest::Client::builder()
-        .user_agent("hfdl/0.1")
+        .user_agent(concat!("glm-ssd/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
         .read_timeout(Duration::from_secs(45))
@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
     // Other repos get their own folder: their files often have the same names as the official
     // ones (UD-IQ2_XXS/...) and would otherwise overwrite them.
     let out = args.out.clone().unwrap_or_else(|| {
-        if official { PathBuf::from("models") } else { Path::new("models").join(args.repo.replace('/', "--")) }
+        if official { models.to_path_buf() } else { models.join(args.repo.replace('/', "--")) }
     });
     let entries = list_tree(&api, &args.repo, &args.revision, token.as_deref()).await?;
     let entries: Vec<TreeEntry> = entries.into_iter().filter(|e| e.kind == "file").collect();
@@ -353,12 +353,19 @@ async fn main() -> Result<()> {
         bail!("some files failed verification (they were renamed to *.corrupt); rerun to re-download them");
     }
     println!("done -> {}", out.display());
-    if let (Some(_), false) = (first, official) {
-        // glm-ssd -m takes the folder (any folder name inside models/ works on its own too)
-        let p = std::fs::canonicalize(&out).unwrap_or_else(|_| out.clone());
-        let p = p.to_string_lossy();
-        let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
-        println!("run it with:  glm-ssd chat -m \"{p}\" --vram-budget 22G --ram-budget 12G");
+    if first.is_some() {
+        // -m takes the folder; a folder name inside the models folder works on its own too
+        let m = match (&args.out, official) {
+            (None, true) => String::new(),
+            (None, false) => format!(" -m {}", args.repo.replace('/', "--")),
+            (Some(_), _) => {
+                let p = std::fs::canonicalize(&out).unwrap_or_else(|_| out.clone());
+                let p = p.to_string_lossy();
+                format!(" -m \"{}\"", p.strip_prefix(r"\\?\").unwrap_or(&p))
+            }
+        };
+        println!("next (optional: a second copy of the expert weights on disk, ~10% faster decoding):  glm-ssd repack{m}");
+        println!("then:  glm-ssd chat{m}");
     }
     Ok(())
 }

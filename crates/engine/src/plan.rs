@@ -12,14 +12,6 @@ use anyhow::{bail, Result};
 use gguf::Gguf;
 use std::collections::BTreeMap;
 
-/// One routed expert of one layer = 3 contiguous extents in the GGUF (gate, up, down slices).
-#[derive(Debug, Clone, Copy)]
-pub struct ExpertExtent {
-    pub shard: usize,
-    pub offset: u64,
-    pub len: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct LayerExperts {
     pub layer: usize,

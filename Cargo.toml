@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tools/hfdl", "crates/gguf", "crates/quants", "crates/cuda", "crates/engine"]
+members = ["crates/gguf", "crates/quants", "crates/cuda", "crates/engine"]
 
 [profile.release]
 opt-level = 3
