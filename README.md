@@ -56,9 +56,21 @@ on the reference machine, against ~6 with 22 GB). A SATA SSD or a hard drive is 
 ## Quick start
 
 1. **Get glm-ssd.** Download `glm-ssd-v0.1.0-windows-x64.zip` from the
-   [latest release](https://github.com/ManyGlue0/GLM-SSD/releases/latest) and unzip it to a drive with
-   ~200 GB free (models are stored next to the exe by default). Open a terminal in that folder.
-   To build it yourself instead, see [Building from source](#building-from-source).
+   [latest release](https://github.com/ManyGlue0/GLM-SSD/releases/latest) and unzip it into a
+   folder on a drive with ~200 GB free, e.g. `D:\glm-ssd`. Models are stored in a `models`
+   folder next to the exe. To build it yourself instead, see
+   [Building from source](#building-from-source).
+
+   **Add it to PATH** so that `glm-ssd` works from any folder. Open PowerShell in the folder
+   (in Explorer: right-click inside it → *Open in Terminal*) and run:
+
+   ```
+   [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$PWD", "User")
+   ```
+
+   Then open a new terminal. The models stay next to the exe whichever folder you run it from.
+   If you skip this step, run it from its own folder as `.\glm-ssd` (PowerShell doesn't run
+   programs from the current folder without the `.\`).
 
 2. **Download the model** (~102 GB, unsloth's `UD-IQ2_XXS` GGUF). The download is resumable and
    SHA-256 verified; if it's interrupted, run the same command again:
