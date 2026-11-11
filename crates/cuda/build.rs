@@ -38,9 +38,12 @@ fn main() {
         .flag("-O3")
         .flag("--use_fast_math")
         .flag("-std=c++20")
-        .flag("-lineinfo")
         .flag("-Xcompiler=/MD") // match Rust's MSVC CRT
         .include("kernels");
+    // line info for profilers; release builds (GLMSSD_PORTABLE) leave it out, it embeds source paths
+    if std::env::var_os("GLMSSD_PORTABLE").is_none() {
+        b.flag("-lineinfo");
+    }
     if archs.len() == 1 {
         let a = &archs[0];
         b.flag(if a == "native" || a.starts_with("all") { format!("-arch={a}") } else { format!("-arch=sm_{a}") });
@@ -61,6 +64,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=cudart_static");
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-env-changed=GLMSSD_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=GLMSSD_PORTABLE");
 }
 
 /// Directory containing the x64 host cl.exe of the newest Visual Studio install.

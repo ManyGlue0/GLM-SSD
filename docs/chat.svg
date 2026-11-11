@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="909" height="495" viewBox="0 0 909 495">
+<rect width="909" height="495" rx="10" fill="#14171c"/>
+<circle cx="20" cy="18" r="6" fill="#ff5f56"/><circle cx="40" cy="18" r="6" fill="#ffbd2e"/><circle cx="60" cy="18" r="6" fill="#27c93f"/>
+<g font-family="Cascadia Mono, Consolas, Menlo, monospace" font-size="14" xml:space="preserve">
+<text x="18" y="54"><tspan fill="#7fb4ff">PS E:\glm-ssd&gt; </tspan><tspan fill="#ffffff" font-weight="600">glm-ssd chat --mtp --effort low --temp 0</tspan></text>
+<text x="18" y="73"><tspan fill="#7b8494">auto budgets: --vram-budget 22.00G (22.76 GiB free on NVIDIA GeForce RTX 3090), --ram-budget 6.00G (9.4</tspan></text>
+<text x="18" y="92"><tspan fill="#7b8494">GiB available) (pass the flags to choose)</tspan></text>
+<text x="18" y="111"><tspan fill="#7b8494">loading the model...</tspan></text>
+<text x="18" y="130"><tspan fill="#7b8494">loaded 1282 resident tensors, 5.88 GiB in 3.5s</tspan></text>
+<text x="18" y="149"><tspan fill="#7b8494">engine ready in 4.8s: ctx 32768 | chunk 512 | MTP on | expert cache: 1885 VRAM slots (13.5 GiB) + 595</tspan></text>
+<text x="18" y="168"><tspan fill="#7b8494">RAM slots (4.3 GiB) | experts from the repacked file</tspan></text>
+<text x="18" y="187"><tspan fill="#7b8494">model loaded in 4.9s</tspan></text>
+<text x="18" y="206"><tspan fill="#7b8494">commands: /exit  /reset  /stats  /effort low|high|max  /think (toggle reasoning display); end a line</tspan></text>
+<text x="18" y="225"><tspan fill="#7b8494">with \ to continue it</tspan></text>
+<text x="18" y="263"><tspan fill="#ffffff" font-weight="700">&gt; </tspan><tspan fill="#d8dee9">In two sentences: why can a 102 GB model run on a 24 GB GPU?</tspan></text>
+<text x="18" y="282"><tspan fill="#7b8494">Explain quantization and offloading/streaming.</tspan></text>
+<text x="18" y="301"><tspan fill="#d8dee9">A 102 GB model can run on a 24 GB GPU because the weights are typically quantized (e.g., to 4-bit</tspan></text>
+<text x="18" y="320"><tspan fill="#d8dee9">precision, cutting memory needs by ~4x) and split across memory sources, with layers or weights streamed</tspan></text>
+<text x="18" y="339"><tspan fill="#d8dee9">from CPU RAM or disk via techniques like memory-mapping or offloading. Additionally, only the active</tspan></text>
+<text x="18" y="358"><tspan fill="#d8dee9">layers need to reside in GPU memory at any moment, so frameworks like llama.cpp can compute the model</tspan></text>
+<text x="18" y="377"><tspan fill="#d8dee9">piece-by-piece at the cost of slower inference speed.</tspan></text>
+<text x="18" y="396"><tspan fill="#7b8494">[prompt 31 tok (0 cached) 6.8s = 4.6 tok/s | gen 112 tok 23.4s = 4.80 tok/s | MTP accepted 47/64 (73%) |</tspan></text>
+<text x="18" y="415"><tspan fill="#7b8494">experts: 41456 uses | VRAM hit 46% | RAM hit 13% | SSD 41% | read 152.70 GB, waited 22.7s | prefetch</tspan></text>
+<text x="18" y="434"><tspan fill="#7b8494">2753/2877 useful]</tspan></text>
+<text x="18" y="472"><tspan fill="#ffffff" font-weight="700">&gt; </tspan></text>
+</g></svg>

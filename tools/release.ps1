@@ -10,9 +10,13 @@ Set-Location (Split-Path $PSScriptRoot -Parent)
 
 $env:GLMSSD_PORTABLE = "1"
 $env:GLMSSD_CUDA_ARCH = "80,86,89,90,120"
+# keep the build machine's paths (user name, folders) out of the binary
+$repo = (Get-Location).Path
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+$env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$repo=glm-ssd -C link-arg=/PDBALTPATH:%_PDB%"
 cargo build --release --locked -p glm-ssd --target-dir target\portable
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
-Remove-Item Env:GLMSSD_PORTABLE, Env:GLMSSD_CUDA_ARCH
+Remove-Item Env:GLMSSD_PORTABLE, Env:GLMSSD_CUDA_ARCH, Env:RUSTFLAGS
 
 $version = (Select-String -Path crates\engine\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 $name = "glm-ssd-v$version-windows-x64"

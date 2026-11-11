@@ -17,6 +17,8 @@ apps and coding agents can talk to.
   prefetching of the next layer's experts, and optional cache-aware routing for more speed.
 - Context up to 128K tokens on a 24 GB GPU.
 
+![A glm-ssd chat session on an RTX 3090](docs/chat.svg)
+
 > **Status:** an early release (v0.1). It runs on Windows only, with one NVIDIA GPU, and supports
 > only the GLM-5.3-Flash architecture. See [Limitations](#limitations).
 
@@ -54,7 +56,7 @@ on the reference machine, against ~6 with 22 GB). A SATA SSD or a hard drive is 
 ## Quick start
 
 1. **Get glm-ssd.** Download `glm-ssd-v0.1.0-windows-x64.zip` from the
-   [Releases](https://github.com/ManyGlue0/GLM-SSD/releases) page and unzip it to a drive with
+   [latest release](https://github.com/ManyGlue0/GLM-SSD/releases/latest) and unzip it to a drive with
    ~200 GB free (models are stored next to the exe by default). Open a terminal in that folder.
    To build it yourself instead, see [Building from source](#building-from-source).
 

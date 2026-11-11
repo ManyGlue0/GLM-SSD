@@ -20,8 +20,10 @@ use serde_json::{json, Value as Json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-/// The official model (`glm-ssd download` with no arguments), relative to the models folder.
-const OFFICIAL_MODEL: &str = "UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf";
+/// The official model (`glm-ssd download` with no arguments): its first shard.
+fn official_model() -> PathBuf {
+    models_dir().join("UD-IQ2_XXS").join("GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf")
+}
 
 /// Where models live: GLMSSD_MODELS if set, else a `models` folder next to the executable
 /// (release zips), else, for builds from source, the repository's `models` folder (so an
@@ -51,7 +53,7 @@ fn models_dir() -> &'static std::path::Path {
 fn default_model() -> &'static str {
     static M: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     M.get_or_init(|| {
-        let official = models_dir().join(OFFICIAL_MODEL);
+        let official = official_model();
         let p = if official.exists() || !models_dir().is_dir() { official } else { models_dir().to_path_buf() };
         p.display().to_string()
     })
@@ -569,7 +571,7 @@ fn profile_path(a: &EngineArgs) -> PathBuf {
         _ => x == y,
     };
     match a.model.parent() {
-        Some(dir) if !same(&a.model, &models_dir().join(OFFICIAL_MODEL)) => dir.join("hot-experts.txt"),
+        Some(dir) if !same(&a.model, &official_model()) => dir.join("hot-experts.txt"),
         _ => models_dir().join("hot-experts.txt"),
     }
 }
