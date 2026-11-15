@@ -19,7 +19,7 @@ apps and coding agents can talk to.
 
 ![A glm-ssd chat session on an RTX 3090](docs/chat.svg)
 
-> **Status:** an early release (v0.1). It runs on Windows only, with one NVIDIA GPU, and supports
+> **Status:** an early release (v0.2). It runs on Windows only, with one NVIDIA GPU, and supports
 > only the GLM-5.3-Flash architecture. See [Limitations](#limitations).
 
 ## Contents
@@ -35,6 +35,7 @@ apps and coding agents can talk to.
 - [Performance](#performance)
 - [How it works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
+- [Security](#security)
 - [Building from source](#building-from-source)
 - [Limitations](#limitations)
 - [License and credits](#license-and-credits)
@@ -55,7 +56,7 @@ on the reference machine, against ~6 with 22 GB). A SATA SSD or a hard drive is 
 
 ## Quick start
 
-1. **Get glm-ssd.** Download `glm-ssd-v0.1.0-windows-x64.zip` from the
+1. **Get glm-ssd.** Download `glm-ssd-v0.2.0-windows-x64.zip` from the
    [latest release](https://github.com/ManyGlue0/GLM-SSD/releases/latest) and unzip it into a
    folder on a drive with ~200 GB free, e.g. `D:\glm-ssd`. Models are stored in a `models`
    folder next to the exe. To build it yourself instead, see
@@ -126,8 +127,9 @@ glm-ssd serve --mtp --ctx 65536
 ```
 
 This listens on `http://127.0.0.1:8080` (`--addr` to change it). Point any OpenAI-compatible
-client at `http://127.0.0.1:8080/v1` with any API key and the model name `glm-5.3-flash`
-(`--name` to change it).
+client at `http://127.0.0.1:8080/v1` with any API key (unless you set one, see
+[Access from browsers and other machines](#access-from-browsers-and-other-machines)) and the
+model name `glm-5.3-flash` (`--name` to change it).
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\": \"glm-5.3-flash\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}], \"stream\": true}"
@@ -169,6 +171,37 @@ longer than ~100 tokens reads nearly every expert that isn't cached, once (~10-1
 compute for its length. If your client hides `reasoning_content`, the wait also includes the
 reasoning; use `reasoning_effort` `low` or `high` for quicker replies.
 
+**Special tokens in messages.** Text such as `<|assistant|>` inside the content of user, system
+or tool messages is read by the model as plain text, so pasted text or tool output can't fake a
+conversation turn. `--parse-special-in-content` makes such strings act as control tokens again,
+for clients that embed them on purpose. The raw prompt of `/v1/completions` is always parsed
+as given.
+
+### Access from browsers and other machines
+
+Clients that send no `Origin` header (curl, scripts, native apps and most coding agents) can
+always use the server. The rules below matter only for web pages in a browser and for listening
+on a non-loopback address.
+
+- **Browser pages.** Only pages served from `localhost`, `127.0.0.1` or `[::1]` (any port) may
+  call the API; a page from any other origin, including a file opened in the browser, gets
+  HTTP 403. This stops other websites you visit from using your model. Allow more origins with
+  `--cors-origin` (repeatable; `*` allows any page):
+
+  ```
+  glm-ssd serve --mtp --cors-origin http://myhost:3000
+  ```
+
+- **API key.** `--api-key KEY` (or the `GLMSSD_API_KEY` environment variable) makes every `/v1`
+  request require `Authorization: Bearer KEY`; clients send it as their API key. `/health` and
+  `/props` stay open.
+- **Other machines.** On `127.0.0.1` the server is reachable only from this PC, and only under
+  the names `localhost`, `127.0.0.1` and `[::1]`. To serve your network, listen on its address,
+  e.g. `--addr 0.0.0.0:8080`, and set an API key: without one, anyone who can reach the port can
+  use the model and read the conversation in its prompt cache (the server prints a warning).
+
+Request bodies are limited to 32 MiB.
+
 ## Memory budgets
 
 By default glm-ssd uses the free VRAM minus 0.75 GiB, and 2/3 of the RAM that is available when
@@ -202,7 +235,7 @@ reference machine). In order of impact:
 4. **`--cache-aware 0.1`**: when an expert of routing rank 3-8 isn't cached and a cached expert
    scored almost as high (within 0.1), use the cached one. On our tests this gave +65% decode
    speed with no measurable perplexity change. `0.2` gives +95% at about +1.3% perplexity.
-   Outputs then depend on what is cached, so they are not exactly reproducible.
+   Outputs then also depend on what is cached.
 5. **`--kv-cache q8`**: a context cache 47% smaller, with no measurable quality change. It
    leaves more VRAM for experts at long contexts.
 
@@ -235,8 +268,11 @@ model) on exit. `--preload` fills the caches from it at start-up, so the first a
 | `--max-output N` | chat/serve: max tokens per answer, reasoning included (default 0 = until the model stops). In serve, a request's `max_tokens` takes precedence |
 | `--temp --top-p --top-k --min-p --seed` | sampling (defaults 0.7 / 0.95 / 40 / 0 / random) |
 
-Environment variables: `GLMSSD_MODELS` (the models folder), `GLMSSD_MODEL` (default `-m`) and
-`HF_TOKEN` (for gated or private Hugging Face repos).
+`serve` adds `--addr`, `--name`, `--no-reasoning-replay`, `--cors-origin`, `--api-key` and
+`--parse-special-in-content` (see [OpenAI-compatible server](#openai-compatible-server)).
+
+Environment variables: `GLMSSD_MODELS` (the models folder), `GLMSSD_MODEL` (default `-m`),
+`GLMSSD_API_KEY` (default `--api-key`) and `HF_TOKEN` (for gated or private Hugging Face repos).
 
 ## Other GLM-5.3-Flash models
 
@@ -272,8 +308,8 @@ RTX 3090 (24 GB) + Samsung 990 PRO, budgets 22G VRAM / 12G RAM, repacked experts
 | prefill, fresh 2.1K-token prompt | 18.6 s (~113 tok/s) |
 
 While decoding, the SSD runs at its random-read maximum (~5.7 GB/s) for most of each token.
-`glm-ssd bench` measures decode speed on your machine. `glm-ssd run --prompt "..." -n 200`
-prints a per-token breakdown (router sync, SSD wait, kernel launches) and SSD utilization.
+`glm-ssd bench` measures decode speed on your machine. It and `glm-ssd run --prompt "..." -n 200`
+print a per-token breakdown (router sync, SSD wait, kernel launches) and SSD utilization.
 `glm-ssd ppl --file text.txt` measures perplexity and speed, to compare options.
 
 ## How it works
@@ -301,6 +337,10 @@ The engine was validated against llama.cpp: `glm-ssd run --trace` prints per-lay
 statistics comparable with `llama-eval-callback`, `ref-l0` is an f64 CPU reference of layer 0,
 and `qtest` checks every CUDA quant kernel against the CPU reference.
 
+Output varies slightly from run to run, even with a fixed `--seed`, because each layer adds up
+its experts in the order they arrive from the SSD. For A/B comparisons, set the environment
+variable `GLMSSD_DETERMINISTIC=1`: output is then bit-reproducible, at about 18% lower speed.
+
 ## Troubleshooting
 
 **`... not found. Download the model first`**: run `glm-ssd download`, or pass
@@ -322,6 +362,24 @@ SSD. Later turns reuse the caches and the prompt cache. `--preload` warms the ca
 **The repacked file is ignored** (the start-up line says `experts from the GGUF`): it no longer
 matches the model, for example after a re-download. Run `glm-ssd repack` again (`--force`
 rebuilds an up-to-date one). Deleting the `.glm-ssd-experts` file is always safe.
+
+**A web app gets HTTP 403 `origin not allowed`**: start the server with
+`--cors-origin <the page's origin>` (see
+[Access from browsers and other machines](#access-from-browsers-and-other-machines)).
+`forbidden host` means the server on `127.0.0.1` was called under another name; use `localhost`
+or `127.0.0.1`.
+
+## Security
+
+- By default the server listens on `127.0.0.1`, so only this PC can reach it, and only browser
+  pages from `localhost` may call it. `--api-key` requires a key on every API request; set one
+  whenever the server listens on a network address. Details in
+  [Access from browsers and other machines](#access-from-browsers-and-other-machines).
+- Model files (GGUF headers, tensor shapes, hyper-parameters), the saved session and
+  `hot-experts.txt` are validated at load: a malformed or incompatible file gives an error
+  message instead of a crash (bad lines in `hot-experts.txt` are skipped).
+- `glm-ssd download` writes only inside the model's folder and sends `HF_TOKEN` only to
+  huggingface.co.
 
 ## Building from source
 
