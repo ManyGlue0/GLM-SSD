@@ -81,7 +81,26 @@ fn expert_layers(g: &Gguf) -> Result<Vec<(usize, [TensorInfo; 3])>> {
     if out.is_empty() {
         bail!("the model has no routed-expert tensors");
     }
+    // pers() / n_expert_of() index dims[2] and divide by it: check the shapes once here (R1, R2)
+    let n_expert = out[0].1[0].dims.get(2).copied().unwrap_or(0);
+    for (il, ts) in &out {
+        for t in ts {
+            expert_per(t)?;
+            if t.dims[2] != n_expert {
+                bail!("blk.{il}: {} has {} experts, layer {} has {n_expert}", t.name, t.dims[2], out[0].0);
+            }
+        }
+    }
     Ok(out)
+}
+
+/// Bytes of one expert's slice of a 3-D expert tensor `[in, out, n_expert]`; an error for any
+/// other shape (R1 / P1).
+pub fn expert_per(t: &TensorInfo) -> Result<u64> {
+    match t.dims[..] {
+        [_, _, ne] if ne >= 1 && t.n_bytes % ne == 0 => Ok(t.n_bytes / ne),
+        _ => bail!("{}: expert tensor must be 3-D [in, out, n_expert] with whole slices (dims {:?})", t.name, t.dims),
+    }
 }
 
 fn pers(t: &[TensorInfo; 3]) -> [u64; 3] {
@@ -340,4 +359,22 @@ pub fn repack(g: &Gguf, force: bool) -> Result<()> {
         total as f64 / 1e9
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ti(dims: &[u64], n_bytes: u64) -> TensorInfo {
+        TensorInfo { name: "blk.3.ffn_gate_exps.weight".into(), dims: dims.to_vec(), ty: gguf::GgmlType::Q8_0, shard: 0, offset: 0, n_bytes }
+    }
+
+    #[test]
+    fn r1_expert_slice_of_bad_shapes_is_an_error() {
+        assert_eq!(expert_per(&ti(&[64, 2, 4], 4 * 136)).unwrap(), 136);
+        assert!(expert_per(&ti(&[64, 2], 136)).is_err()); // < 3 dims: no index panic
+        assert!(expert_per(&ti(&[64, 2, 0], 0)).is_err()); // no division by zero
+        assert!(expert_per(&ti(&[64, 2, 3], 100)).is_err()); // not whole slices
+        assert!(expert_per(&ti(&[64, 2, 4, 1], 4 * 136)).is_err());
+    }
 }

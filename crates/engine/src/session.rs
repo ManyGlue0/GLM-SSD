@@ -147,9 +147,10 @@ impl Session {
 
     /// Write the conversation state (tokens, attention caches, prompt-cache snapshots) to `path`,
     /// so a later engine with the same options can continue it without re-reading the prompt.
-    pub fn save_to(&self, path: &std::path::Path) -> Result<u64> {
+    /// Save the conversation state into an already created file (the park file is created
+    /// exclusively with an unpredictable name, see holder.rs).
+    pub fn save_to_file(&self, f: std::fs::File) -> Result<u64> {
         use crate::forward::{put_bytes, put_u64};
-        let f = std::fs::File::create(path)?;
         let mut w = std::io::BufWriter::with_capacity(8 << 20, f);
         w.write_all(SESSION_MAGIC)?;
         put_bytes(&mut w, cuda::bytes_of(&self.history))?;
@@ -160,7 +161,8 @@ impl Session {
         }
         self.eng.save_state(&mut w)?;
         w.flush()?;
-        Ok(std::fs::metadata(path)?.len())
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        Ok(f.metadata()?.len())
     }
 
     /// Continue the conversation saved by `save_to`. On error the session is reset (empty).
@@ -185,6 +187,11 @@ impl Session {
         let words = |b: Vec<u8>| -> Vec<u32> { b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() };
         let history = words(get_bytes(&mut r)?);
         let logits: Vec<f32> = words(get_bytes(&mut r)?).into_iter().map(f32::from_bits).collect();
+        let nv = self.eng.cfg.n_vocab;
+        anyhow::ensure!(
+            (logits.is_empty() || logits.len() == nv) && history.iter().all(|&t| (t as usize) < nv),
+            "corrupt session file"
+        );
         let n = get_u64(&mut r)? as usize;
         anyhow::ensure!(n <= 4096, "corrupt session file");
         let snaps = (0..n).map(|_| Snapshot::read_from(&mut r)).collect::<Result<Vec<_>>>()?;
@@ -231,9 +238,9 @@ impl Session {
         let start = if self.eng.pos == self.history.len() && self.history.len() <= target {
             self.history.len() // pure continuation
         } else if let Some(s) = self.snaps.iter().filter(|s| s.pos <= target).max_by_key(|s| s.pos) {
+            // `s` borrows `self.snaps`, `restore` borrows `self.eng`: disjoint fields (X1)
             let pos = s.pos;
-            let snap = s as *const Snapshot;
-            self.eng.restore(unsafe { &*snap })?;
+            self.eng.restore(s)?;
             pos
         } else {
             self.eng.reset()?;

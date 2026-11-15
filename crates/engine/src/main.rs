@@ -13,6 +13,7 @@ mod repack;
 mod server;
 mod session;
 mod tokenizer;
+mod validate;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -335,6 +336,17 @@ enum Cmd {
         /// without it (they are then re-read without reasoning: slower, follows the client exactly)
         #[arg(long)]
         no_reasoning_replay: bool,
+        /// Also allow browser pages from this origin (e.g. http://myhost:3000); repeatable; `*`
+        /// allows any page. Loopback pages (http://localhost:*, 127.0.0.1, [::1]) are always allowed
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
+        /// Require `Authorization: Bearer <KEY>` on /v1 requests
+        #[arg(long, env = "GLMSSD_API_KEY", value_name = "KEY", hide_env_values = true)]
+        api_key: Option<String>,
+        /// Let special-token strings (e.g. `<|assistant|>`) typed inside the content of non-assistant
+        /// messages (user, system, tool, ...) act as control tokens (old behaviour; default: plain text)
+        #[arg(long)]
+        parse_special_in_content: bool,
     },
     /// Decode benchmark: chat prompt -> N generated tokens (greedy), steady-state speed
     #[command(display_order = 4)]
@@ -485,7 +497,7 @@ fn main() -> Result<()> {
         Cmd::Chat { eng, sample, system, effort, hide_think, max_output } => {
             chat_repl(&eng, &sample, system, effort, hide_think, max_output)?
         }
-        Cmd::Serve { eng, sample, addr, name, max_output, no_reasoning_replay } => {
+        Cmd::Serve { eng, sample, addr, name, max_output, no_reasoning_replay, cors_origin, api_key, parse_special_in_content } => {
             let g = gguf::Gguf::open_shard(&eng.model)?;
             let model = holder(&eng);
             drop(model.lock()?); // load now so the first request is fast; idle clock starts
@@ -498,6 +510,9 @@ fn main() -> Result<()> {
                 ctx: eng.ctx,
                 sampler: sample.cfg(),
                 replay: (!no_reasoning_replay).then(Default::default),
+                cors_origins: cors_origin,
+                api_key: api_key.filter(|k| !k.is_empty()),
+                parse_special_in_content,
             };
             server::serve(&addr, srv)?;
         }
@@ -620,6 +635,12 @@ fn start(a: &EngineArgs) -> Result<(gguf::Gguf, session::Session)> {
     Ok((g, session::Session::new(eng, a.snapshots)))
 }
 
+/// Candidates shown per position by `run --top` (M2): 1..=vocab, else an error.
+fn top_count(top: usize, n_vocab: usize) -> Result<usize> {
+    anyhow::ensure!(top <= n_vocab, "--top {top} is larger than the vocabulary ({n_vocab} tokens)");
+    Ok(top.max(1))
+}
+
 fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usize, sequential: bool, trace: bool, top: usize) -> Result<()> {
     let (g, mut sess) = start(a)?;
     let vocab = tokenizer::Vocab::from_gguf(&g)?;
@@ -628,6 +649,8 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
         (None, Some(p)) => vocab.encode(&p.replace("\\n", "\n"), true),
         _ => anyhow::bail!("give --tokens or --prompt"),
     };
+    anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+    let k = top_count(top, sess.eng.cfg.n_vocab)?;
     let eng = &mut sess.eng;
     eng.trace = trace;
     let shown: String = vocab.decode(&prompt).chars().take(300).collect();
@@ -643,16 +666,16 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
         }
         l
     } else {
-        eng.forward(&prompt, forward::Rows::Last, false)?.into_iter().next().unwrap()
+        eng.forward(&prompt, forward::Rows::Last, false)?.into_iter().next().context("no logits for the prompt")?
     };
     let prompt_time = t0.elapsed();
     eprintln!("prefill: {}", eng.experts.summary());
     let mut out = Vec::new();
-    let (tm0, st0, busy0) = (eng.timings.clone(), eng.experts.stats.clone(), eng.experts.io_busy());
+    let p0 = Probe::take(eng);
     let t1 = std::time::Instant::now();
     for _ in 0..n_predict {
         let l = &logits;
-        let k = top.max(1);
+        anyhow::ensure!(l.len() >= k, "no logits");
         let mut idx: Vec<usize> = (0..l.len()).collect();
         idx.select_nth_unstable_by(k - 1, |a, b| l[*b].total_cmp(&l[*a]));
         let mut best: Vec<usize> = idx[..k].to_vec();
@@ -666,7 +689,7 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
         if eng.cfg.eos.contains(&next) {
             break;
         }
-        logits = eng.forward(&[next], forward::Rows::Last, false)?.into_iter().next().unwrap();
+        logits = eng.forward(&[next], forward::Rows::Last, false)?.into_iter().next().context("no logits")?;
     }
     let gen_time = t1.elapsed();
     println!("\noutput: {:?}", vocab.decode(&out));
@@ -679,31 +702,69 @@ fn run(a: &EngineArgs, tokens: Option<&str>, text: Option<&str>, n_predict: usiz
         eng.timings.moe.as_secs_f64()
     );
     println!("{}", eng.experts.summary());
-    if !out.is_empty() {
-        let (tm, st) = (&eng.timings, &eng.experts.stats);
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / out.len() as f64;
-        let wait = st.read_time - st0.read_time;
-        let busy = eng.experts.io_busy() - busy0;
-        let mb = (st.read_bytes - st0.read_bytes) as f64 / 1e6 / out.len() as f64;
-        println!(
-            "SSD: {mb:.0} MB/token, busy {:.0}% of decode time ({:.2} GB/s while busy)",
-            100.0 * busy.as_secs_f64() / gen_time.as_secs_f64(),
-            (st.read_bytes - st0.read_bytes) as f64 / 1e9 / busy.as_secs_f64().max(1e-9)
-        );
-        println!(
-            "decode ms/token: total {:.1} = MoE {:.1} (router sync {:.1}, expert fetch {:.1} of which SSD wait {:.1},              expert launches {:.1}, rest {:.1}) + non-MoE {:.1}",
-            ms(gen_time),
-            ms(tm.moe - tm0.moe),
-            ms(tm.router - tm0.router),
-            ms(tm.next - tm0.next),
-            ms(wait),
-            ms(tm.launch - tm0.launch),
-            ms((tm.moe - tm0.moe).saturating_sub((tm.router - tm0.router) + (tm.next - tm0.next) + (tm.launch - tm0.launch))),
-            ms(gen_time.saturating_sub(tm.moe - tm0.moe)),
-        );
-    }
+    print_breakdown(eng, &p0, out.len(), gen_time);
     eng.experts.save_profile()?;
     Ok(())
+}
+
+/// Engine counters at one moment; `print_breakdown` reports the decode work since then.
+struct Probe {
+    tm: forward::Timings,
+    st: experts::Stats,
+    busy: std::time::Duration,
+}
+impl Probe {
+    fn take(eng: &forward::Engine) -> Self {
+        Self { tm: eng.timings.clone(), st: eng.experts.stats.clone(), busy: eng.experts.io_busy() }
+    }
+}
+
+/// Per-token decode breakdown since `p0`: `n` generated tokens in `wall` (wall-clock time of the
+/// decode loop). Everything is divided by the tokens produced, whatever work produced them: with
+/// MTP, a 2-token verify pass and the draft before it count in full, also when the draft is
+/// rejected (its wasted work shows up as trunk positions run vs tokens produced). MoE covers the
+/// trunk's MoE layers and the MTP layer's MoE; "non-MoE" is the rest of the wall time (attention,
+/// mHC, LM head, embedding, sampling, MTP rollback).
+fn print_breakdown(eng: &forward::Engine, p0: &Probe, n: usize, wall: std::time::Duration) {
+    if n == 0 {
+        return;
+    }
+    let (tm, st) = (&eng.timings, &eng.experts.stats);
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / n as f64;
+    let read = st.read_bytes.saturating_sub(p0.st.read_bytes) as f64;
+    let busy = eng.experts.io_busy().saturating_sub(p0.busy).as_secs_f64();
+    println!(
+        "SSD: {:.0} MB/token, busy {:.0}% of decode time ({:.2} GB/s while busy)",
+        read / 1e6 / n as f64,
+        100.0 * busy / wall.as_secs_f64().max(1e-9),
+        read / 1e9 / busy.max(1e-9)
+    );
+    let moe = tm.moe.saturating_sub(p0.tm.moe);
+    let router = tm.router.saturating_sub(p0.tm.router);
+    let next = tm.next.saturating_sub(p0.tm.next);
+    let launch = tm.launch.saturating_sub(p0.tm.launch);
+    println!(
+        "decode ms/token: total {:.1} = MoE {:.1} (router sync {:.1}, expert fetch {:.1} of which SSD wait {:.1}, expert launches {:.1}, rest {:.1}) + non-MoE {:.1}",
+        ms(wall),
+        ms(moe),
+        ms(router),
+        ms(next),
+        ms(st.read_time.saturating_sub(p0.st.read_time)),
+        ms(launch),
+        ms(moe.saturating_sub(router + next + launch)),
+        ms(wall.saturating_sub(moe)),
+    );
+    let mtp = tm.mtp.saturating_sub(p0.tm.mtp);
+    if !mtp.is_zero() {
+        let mtp_moe = tm.mtp_moe.saturating_sub(p0.tm.mtp_moe);
+        println!(
+            "  of which MTP layer {:.1} (its MoE {:.1}, rest {:.1}) | trunk positions run: {} for {n} tokens",
+            ms(mtp),
+            ms(mtp_moe),
+            ms(mtp.saturating_sub(mtp_moe)),
+            tm.tokens.saturating_sub(p0.tm.tokens)
+        );
+    }
 }
 
 fn chat_repl(a: &EngineArgs, sample: &SampleArgs, system: Option<String>, effort: Option<String>, hide_think: bool, max_output: usize) -> Result<()> {
@@ -889,6 +950,7 @@ fn bench(a: &EngineArgs, message: &str, n_gen: usize) -> Result<()> {
     let mut text = Vec::new();
     let eos = sess.eng.cfg.eos.clone();
     let mut snap = None;
+    let p0 = Probe::take(&sess.eng);
     sess.generate(logits, n_gen, &mut sampler, &mut stats, |tok| {
         times.push(t0.elapsed().as_secs_f64());
         text.push(tok);
@@ -905,6 +967,8 @@ fn bench(a: &EngineArgs, message: &str, n_gen: usize) -> Result<()> {
 {}", stats.line());
     println!("steady-state decode (2nd half): {steady:.2} tok/s");
     println!("{}", sess.eng.experts.summary());
+    // the whole generate call (stats.gen_*), incl. MTP drafts, verify passes and rollbacks
+    print_breakdown(&sess.eng, &p0, stats.gen_tokens, stats.gen_time);
     let _ = snap;
     sess.eng.experts.save_profile()?;
     Ok(())
@@ -916,10 +980,11 @@ fn ppl(a: &EngineArgs, file: &std::path::Path, warm: usize, n: usize) -> Result<
     let text = std::fs::read_to_string(file)?;
     let mut toks = vocab.encode("[gMASK]<sop>", true);
     toks.extend(vocab.encode(&text, false));
+    anyhow::ensure!(warm >= 1, "--warm must be at least 1 (the first token has no prediction to score)");
     anyhow::ensure!(toks.len() > warm + 1, "text too short ({} tokens)", toks.len());
     let end = (warm + n).min(toks.len() - 1);
     let eng = &mut sess.eng;
-    let mut logits = eng.forward(&toks[..warm], forward::Rows::Last, false)?.pop().unwrap();
+    let mut logits = eng.forward(&toks[..warm], forward::Rows::Last, false)?.pop().context("no logits")?;
     let s0 = eng.experts.stats.clone();
     let t0 = std::time::Instant::now();
     let (mut nll, mut top1) = (0f64, 0usize);
@@ -932,7 +997,7 @@ fn ppl(a: &EngineArgs, file: &std::path::Path, warm: usize, n: usize) -> Result<
         if i == end {
             break;
         }
-        logits = eng.forward(&toks[i..i + 1], forward::Rows::Last, false)?.pop().unwrap();
+        logits = eng.forward(&toks[i..i + 1], forward::Rows::Last, false)?.pop().context("no logits")?;
     }
     let scored = end - warm + 1;
     let dt = t0.elapsed().as_secs_f64();
@@ -952,4 +1017,16 @@ fn ppl(a: &EngineArgs, file: &std::path::Path, warm: usize, n: usize) -> Result<
         eng.swaps
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m2_top_larger_than_vocab_is_an_error() {
+        assert_eq!(top_count(0, 10).unwrap(), 1);
+        assert_eq!(top_count(10, 10).unwrap(), 10);
+        assert!(top_count(11, 10).is_err());
+    }
 }

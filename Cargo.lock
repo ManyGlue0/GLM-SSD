@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "cuda"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -429,20 +429,21 @@ dependencies = [
 
 [[package]]
 name = "gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "glm-ssd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "cuda",
  "fancy-regex",
  "futures-util",
+ "getrandom 0.2.17",
  "gguf",
  "globset",
  "indicatif",
@@ -850,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "quants"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gguf",

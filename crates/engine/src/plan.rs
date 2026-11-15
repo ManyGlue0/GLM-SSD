@@ -86,6 +86,7 @@ fn category(name: &str) -> String {
 
 impl Plan {
     pub fn build(g: &Gguf, cfg: &Config, b: &Budgets) -> Result<Plan> {
+        crate::validate::validate_model(g, cfg, b.with_mtp)?;
         let n_used_layers = if b.with_mtp { cfg.n_layer_all() } else { cfg.n_layer };
         let mut vram_resident = 0u64;
         let mut ram_resident = 0u64;
@@ -107,7 +108,7 @@ impl Plan {
                 None
             };
             if let (Some(s), Some(l)) = (slot, layer) {
-                let per = t.n_bytes / t.dims[2];
+                let per = crate::repack::expert_per(t)?;
                 exp.entry(l).or_default()[s] = Some((ti, t.ty, per));
                 continue;
             }

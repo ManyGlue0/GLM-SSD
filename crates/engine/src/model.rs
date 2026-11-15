@@ -85,10 +85,10 @@ impl Weights {
                 DTensor {
                     ptr: unsafe { (buf.ptr() as *mut u8).add(off) } as *mut c_void,
                     ty: t.ty,
-                    d0: t.dims[0] as usize,
+                    d0: *t.dims.first().with_context(|| format!("{}: 0-d tensor", t.name))? as usize,
                     d1: t.dims.get(1).copied().unwrap_or(1) as usize,
                     d2: t.dims.get(2).copied().unwrap_or(1) as usize,
-                    row_bytes: t.ty.row_bytes(t.dims[0]) as usize,
+                    row_bytes: t.row_bytes() as usize,
                 },
             );
             off += t.n_bytes as usize;

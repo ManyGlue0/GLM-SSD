@@ -278,6 +278,14 @@ impl Drop for Event {
     }
 }
 
+/// `off..off+len` must lie inside a buffer of `cap` bytes (no overflow, no panic: U2).
+fn check_range(off: usize, len: usize, cap: usize) -> Result<()> {
+    match off.checked_add(len) {
+        Some(end) if end <= cap => Ok(()),
+        _ => bail!("device buffer access out of range: {off} + {len} > {cap} bytes"),
+    }
+}
+
 /// Untyped device allocation.
 pub struct DeviceBuffer {
     ptr: *mut c_void,
@@ -301,7 +309,7 @@ impl DeviceBuffer {
         self.ptr
     }
     pub fn upload(&self, off: usize, src: &[u8], s: &Stream) -> Result<()> {
-        assert!(off + src.len() <= self.len);
+        check_range(off, src.len(), self.len)?;
         check(unsafe { ffi::gs_memcpy_h2d((self.ptr as *mut u8).add(off) as _, src.as_ptr() as _, src.len(), s.0) })
     }
     pub fn zero(&self, s: &Stream) -> Result<()> {
@@ -311,7 +319,7 @@ impl DeviceBuffer {
         self.ptr as *mut f32
     }
     pub fn download(&self, off: usize, dst: &mut [u8], s: &Stream) -> Result<()> {
-        assert!(off + dst.len() <= self.len);
+        check_range(off, dst.len(), self.len)?;
         check(unsafe { ffi::gs_memcpy_d2h(dst.as_mut_ptr() as _, (self.ptr as *mut u8).add(off) as _, dst.len(), s.0) })
     }
 }
@@ -379,10 +387,23 @@ pub fn smoke_test() -> Result<()> {
     Ok(())
 }
 
-pub fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
+mod sealed {
+    pub trait Sealed {}
+}
+/// Plain numeric types: no padding, and every byte pattern is a valid value, so viewing a slice of
+/// them as bytes (and writing arbitrary bytes into it) is sound (U1). Sealed: only the impls below.
+pub trait Pod: Copy + sealed::Sealed {}
+macro_rules! pod {
+    ($($t:ty),*) => { $(impl sealed::Sealed for $t {} impl Pod for $t {})* };
+}
+pod!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+
+pub fn bytes_of<T: Pod>(v: &[T]) -> &[u8] {
+    // SAFETY: T is a padding-free plain number type (Pod), the length is the slice's byte size
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
-pub fn bytes_of_mut<T: Copy>(v: &mut [T]) -> &mut [u8] {
+pub fn bytes_of_mut<T: Pod>(v: &mut [T]) -> &mut [u8] {
+    // SAFETY: as above, and any byte pattern is a valid T
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
 }
 
@@ -404,5 +425,19 @@ pub struct MoeBatch {
 impl Default for MoeBatch {
     fn default() -> Self {
         Self { gate: [std::ptr::null(); MOE_MAX], up: [std::ptr::null(); MOE_MAX], down: [std::ptr::null(); MOE_MAX], w: [[0.0; MOE_MAX]; MOE_NT], n: 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u2_device_buffer_range_check_does_not_panic() {
+        assert!(check_range(0, 16, 16).is_ok());
+        assert!(check_range(8, 8, 16).is_ok());
+        assert!(check_range(8, 9, 16).is_err());
+        assert!(check_range(usize::MAX, 2, 16).is_err());
+        assert!(check_range(1, usize::MAX, usize::MAX).is_err());
     }
 }

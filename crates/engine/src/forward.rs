@@ -19,6 +19,7 @@ use cuda::{bytes_of, bytes_of_mut, check, ffi, ops, DeviceBuffer, Stream};
 use gguf::{Gguf, TensorInfo};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---- little binary format for saved sessions --------------------------------------------------------
@@ -36,11 +37,17 @@ pub fn get_u64(r: &mut impl Read) -> Result<u64> {
     r.read_exact(&mut b)?;
     Ok(u64::from_le_bytes(b))
 }
+/// Largest blob a session file may hold (an f16 MLA latent cache is ctx * 512 * 2 bytes per layer;
+/// the allocation itself is bounded by what the file really holds, see get_bytes).
+pub const MAX_BLOB: u64 = 1 << 36;
+/// Length-prefixed blob. The length is untrusted: capped, and the bytes are read through
+/// `take` so a lying prefix cannot allocate more than the file holds (X2).
 pub fn get_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
-    let n = get_u64(r)? as usize;
-    anyhow::ensure!(n <= 1 << 36, "corrupt session file");
-    let mut v = vec![0u8; n];
-    r.read_exact(&mut v)?;
+    let n = get_u64(r)?;
+    anyhow::ensure!(n <= MAX_BLOB, "corrupt session file (blob of {n} bytes)");
+    let mut v = Vec::new();
+    (&mut *r).take(n).read_to_end(&mut v)?;
+    anyhow::ensure!(v.len() as u64 == n, "truncated session file");
     Ok(v)
 }
 
@@ -147,6 +154,11 @@ pub struct Timings {
     pub next: Duration,
     /// MoE: enqueueing the expert kernels
     pub launch: Duration,
+    /// MTP layer: wall time inside `mtp_rows` (drafts, and feeding it during prefill), its MoE
+    /// included
+    pub mtp: Duration,
+    /// MTP layer: the MoE part of `mtp` (also counted in `moe` / `router` / `next` / `launch`)
+    pub mtp_moe: Duration,
 }
 
 pub struct EngineOpts {
@@ -180,7 +192,7 @@ struct Sweep {
 }
 
 /// Floats per token of the mHC mixing weights (`hcw` scratch rows).
-const HCW: usize = 24;
+const HCW: usize = crate::validate::HCW;
 
 /// Host copy of the sequence-dependent state that cannot be recomputed from the caches
 /// (prefix caching): KDA states + conv states + indexer rings, at position `pos`.
@@ -202,10 +214,37 @@ impl Snapshot {
     }
     pub fn read_from(r: &mut impl Read) -> Result<Self> {
         let (pos, mtp_pos, pend_n, n) = (get_u64(r)? as usize, get_u64(r)? as usize, get_u64(r)? as usize, get_u64(r)? as usize);
-        anyhow::ensure!(n < 1 << 16, "corrupt session file");
+        anyhow::ensure!(n < 1 << 16 && pend_n <= 1, "corrupt session file");
         let data = (0..n).map(|_| get_bytes(r)).collect::<Result<_>>()?;
         Ok(Self { pos, mtp_pos, pend_n, data })
     }
+}
+
+/// A snapshot fits the engine only if it has one blob per state buffer, each exactly as long.
+fn check_snapshot_layout(snap: &Snapshot, lens: &[usize]) -> Result<()> {
+    anyhow::ensure!(
+        snap.pend_n <= 1 && snap.data.len() == lens.len() && snap.data.iter().zip(lens).all(|(d, &l)| d.len() == l),
+        "snapshot layout mismatch"
+    );
+    Ok(())
+}
+
+/// Split `rows` MTP-feed rows into calls of at most `chunk` rows. A pending row plus a full
+/// chunk is `chunk + 1` rows: the single first row goes alone, the rest follow (E1).
+fn mtp_feed_parts(rows: usize, chunk: usize) -> Vec<(usize, usize)> {
+    let chunk = chunk.max(1);
+    let mut v = Vec::new();
+    let mut off = 0;
+    if rows > chunk {
+        v.push((0, 1));
+        off = 1;
+    }
+    while off < rows {
+        let c = (rows - off).min(chunk);
+        v.push((off, c));
+        off += c;
+    }
+    v
 }
 
 pub struct Engine {
@@ -213,7 +252,9 @@ pub struct Engine {
     files: Vec<File>,
     tok_embd: TensorInfo,
     _w: Weights,
-    layers: Vec<Layer>, // trunk layers, then the MTP layer if enabled
+    /// trunk layers, then the MTP layer if enabled; never mutated after load. Shared behind an Arc so a
+    /// pass can hold a layer while calling `&mut self` methods (one Arc clone per pass, F1)
+    layers: Arc<Vec<Layer>>,
     mtp: Option<MtpHead>,
     states: Vec<LayerState>,
     output_norm: DTensor,
@@ -232,6 +273,9 @@ pub struct Engine {
     pub swaps: u64,
     /// decode: per-expert kernels instead of the fused MoE kernels (GLMSSD_UNFUSED=1, for A/B)
     unfused: bool,
+    /// GLMSSD_DETERMINISTIC=1: routed-expert outputs in per-(rank, token) slots [K][chunk][n] +
+    /// their slot index per flat row, summed in rank order (no SSD-arrival-order dependence)
+    det: Option<(DeviceBuffer, DeviceBuffer)>,
     // per-call position of the first row (for MLA / indexer), and the layer being run
     p0: usize,
 
@@ -288,6 +332,8 @@ fn moe_layers(cfg: &Config, with_mtp: bool) -> Vec<usize> {
 
 impl Engine {
     pub fn new(g: &Gguf, cfg: Config, o: EngineOpts) -> Result<Self> {
+        // config ranges + every tensor shape against the scratch sizes below, before any allocation
+        crate::validate::validate_model(g, &cfg, o.mtp && cfg.n_layer_nextn > 0)?;
         let s = Stream::new()?;
         let copy = Stream::new()?;
         let free0 = cuda::mem_info()?.0;
@@ -411,7 +457,7 @@ impl Engine {
         let n = cfg.n_embd;
         let t = chunk;
         let tq = t.min(TQ);
-        let wide = 16384usize.max(cfg.n_ff).max(cfg.n_head * cfg.mla_head_k).max(2 * d_inner);
+        let wide = crate::validate::wide(&cfg);
         let sel_stride = cfg.idx_top_k + cfg.idx_kpool;
         let tok_embd = g.tensor("token_embd.weight").context("token_embd")?.clone();
         let mut exp_dims = vec![None; n_all];
@@ -486,7 +532,7 @@ impl Engine {
             tok_embd,
             files,
             _w: w,
-            layers,
+            layers: Arc::new(layers),
             mtp,
             states,
             exp_dims,
@@ -502,6 +548,17 @@ impl Engine {
             swaps: 0,
             unfused: std::env::var("GLMSSD_UNFUSED").is_ok_and(|v| v == "1"),
             p0: 0,
+            det: if std::env::var("GLMSSD_DETERMINISTIC").is_ok_and(|v| v == "1") {
+                eprintln!(
+                    "GLMSSD_DETERMINISTIC: chunk-by-chunk prefill, ordered expert sums (positions beyond {} use the \
+                     sparse indexer, whose key order is still not deterministic)",
+                    cfg.idx_top_k
+                );
+                let k = cfg.n_expert_used;
+                Some((DeviceBuffer::new(k * t * n * 4)?, DeviceBuffer::new(k * t * 4)?))
+            } else {
+                None
+            },
             experts: {
                 // whatever the budget leaves after weights, caches and scratch goes to experts
                 check(unsafe { ffi::gs_device_sync() })?;
@@ -571,17 +628,20 @@ impl Engine {
         Ok(Snapshot { pos: self.pos, mtp_pos: self.mtp_pos, pend_n: self.pend_n, data })
     }
     pub fn restore(&mut self, snap: &Snapshot) -> Result<()> {
-        let mut it = snap.data.iter();
+        let mut bufs: Vec<&DeviceBuffer> = Vec::with_capacity(self.states.len() * 2 + 1);
         for st in &self.states {
-            let bufs: [&DeviceBuffer; 2] = match st {
-                LayerState::Kda { s, conv, .. } => [s, conv],
-                LayerState::Mla { ring_k, ring_g, .. } => [ring_k, ring_g],
-            };
-            for b in bufs {
-                b.upload(0, it.next().context("snapshot layout mismatch")?, &self.s)?;
+            match st {
+                LayerState::Kda { s, conv, .. } => bufs.extend([s, conv]),
+                LayerState::Mla { ring_k, ring_g, .. } => bufs.extend([ring_k, ring_g]),
             }
         }
-        self.pend.upload(0, it.next().context("snapshot layout mismatch")?, &self.s)?;
+        bufs.push(&self.pend);
+        // validate the whole layout before touching any buffer (X2)
+        let lens: Vec<usize> = bufs.iter().map(|b| b.len()).collect();
+        check_snapshot_layout(snap, &lens)?;
+        for (b, v) in bufs.iter().zip(&snap.data) {
+            b.upload(0, v, &self.s)?;
+        }
         self.s.sync()?;
         self.pos = snap.pos;
         self.mtp_pos = snap.mtp_pos;
@@ -972,9 +1032,20 @@ impl Engine {
                 flat_w.push(w);
             }
         }
-        if t > 1 {
+        if t > 1 || self.det.is_some() {
             self.tok_idx.upload(0, bytes_of(&flat_idx), &self.s)?;
             self.tok_w.upload(0, bytes_of(&flat_w), &self.s)?;
+        }
+        if let Some((_, sidx)) = &self.det {
+            // slot of each flat row: (rank of the expert in its token's route) * t + token
+            let mut slot = Vec::with_capacity(flat_idx.len());
+            for &e in &used {
+                for &(ti, _) in &groups[e as usize] {
+                    let k = routes[ti as usize].iter().position(|x| x.0 == e).unwrap_or(0);
+                    slot.push((k * t) as i32 + ti);
+                }
+            }
+            sidx.upload(0, bytes_of(&slot), &self.s)?;
         }
 
         // speculative prefetch for the next MoE layer during decode
@@ -996,7 +1067,18 @@ impl Engine {
         let fused = t <= cuda::MOE_NT && !self.unfused && self.chunk >= cuda::MOE_MAX * cuda::MOE_NT;
         while fused {
             let t_n = Instant::now();
-            let batch = self.experts.next_batch(&mut fetch, &self.copy, &self.s, cuda::MOE_MAX)?;
+            let mut batch = self.experts.next_batch(&mut fetch, &self.copy, &self.s, cuda::MOE_MAX)?;
+            if self.det.is_some() {
+                // the whole layer (<= 16 experts for t <= 2, all kept protected) as one batch in id order
+                while batch.len() < cuda::MOE_MAX {
+                    let more = self.experts.next_batch(&mut fetch, &self.copy, &self.s, cuda::MOE_MAX - batch.len())?;
+                    if more.is_empty() {
+                        break;
+                    }
+                    batch.extend(more);
+                }
+                batch.sort_unstable_by_key(|x| x.0);
+            }
             let t_l = Instant::now();
             self.timings.next += t_l - t_n;
             if batch.is_empty() {
@@ -1024,6 +1106,9 @@ impl Engine {
             }
             self.timings.launch += t_l.elapsed();
         }
+        if let (false, Some((slots, _))) = (fused, &self.det) {
+            slots.zero(&self.s)?;
+        }
         while !fused {
             let t_n = Instant::now();
             let Some((e, p)) = self.experts.next(&mut fetch, &self.copy, &self.s)? else { break };
@@ -1034,9 +1119,19 @@ impl Engine {
             self.experts.done_with(il, e, &self.s)?;
             self.timings.launch += t_l.elapsed();
         }
+        if let (false, Some((slots, _))) = (fused, &self.det) {
+            // every (rank, token) slot was written exactly once: sum them in rank order
+            for k in 0..self.cfg.n_expert_used {
+                ck!(ffi::gs_axpy(self.moe_acc.f32(), slots.f32().wrapping_add(k * t * n), 1.0, (t * n) as i64, self.s.raw()));
+            }
+        }
         self.dbg("ffn_moe_out", il as isize, self.moe_acc.f32(), n, t)?;
         ck!(ffi::gs_axpy(self.out.f32(), self.moe_acc.f32(), 1.0, (t * n) as i64, self.s.raw()));
-        self.timings.moe += t_start.elapsed();
+        let dt = t_start.elapsed();
+        self.timings.moe += dt;
+        if il >= self.cfg.n_layer {
+            self.timings.mtp_moe += dt;
+        }
         Ok(())
     }
 
@@ -1046,7 +1141,7 @@ impl Engine {
         let mk = |i: usize, ptr: *const u8| DTensor { ptr: ptr as _, ..dims[i] };
         let (wg, wu, wd) = (mk(0, p.gate), mk(1, p.up), mk(2, p.down));
         let (eg, eu) = (self.eg.f32(), self.eu.f32());
-        if t == 1 {
+        if t == 1 && self.det.is_none() {
             self.mm(&wg, self.xn.f32(), eg, 1)?;
             self.mm(&wu, self.xn.f32(), eu, 1)?;
             ck!(ffi::gs_swiglu(eg, eu, eg, wg.d1 as i64, lim, self.s.raw()));
@@ -1062,7 +1157,11 @@ impl Engine {
         self.mm(&wu, self.xg.f32(), eu, m)?;
         ck!(ffi::gs_swiglu(eg, eu, eg, (m * wg.d1) as i64, lim, self.s.raw()));
         self.mm(&wd, eg, self.ey.f32(), m)?;
-        ck!(ffi::gs_scatter_add_rows(self.moe_acc.f32(), idx, w, self.ey.f32(), m as i32, n as i32, self.s.raw()));
+        let (acc, to) = match &self.det {
+            Some((slots, sidx)) => (slots.f32(), (sidx.ptr() as *const i32).wrapping_add(off)),
+            None => (self.moe_acc.f32(), idx),
+        };
+        ck!(ffi::gs_scatter_add_rows(acc, to, w, self.ey.f32(), m as i32, n as i32, self.s.raw()));
         Ok(())
     }
 
@@ -1074,7 +1173,7 @@ impl Engine {
             return Ok(Vec::new());
         }
         let cap = self.sweep.as_ref().map_or(0, |s| s.cap);
-        if toks.len() > self.chunk && cap > 0 && !save_first && rows != Rows::All && !self.trace {
+        if toks.len() > self.chunk && cap > 0 && !save_first && rows != Rows::All && !self.trace && self.det.is_none() {
             // layer-major passes of up to `cap` tokens
             let n_sp = toks.len().div_ceil(cap);
             let mut out = Vec::new();
@@ -1112,8 +1211,9 @@ impl Engine {
         ck!(ffi::gs_hc_expand(self.x.f32(), self.streams.f32(), t as i32, n as i32, self.s.raw()));
         self.dbg("inp_embd", -1, self.x.f32(), n, t)?;
 
+        let layers = self.layers.clone();
         for il in 0..self.cfg.n_layer {
-            let layer: &Layer = unsafe { &*(&self.layers[il] as *const Layer) }; // layers are never mutated
+            let layer: &Layer = &layers[il];
             let (hca, hcf) = layer.hc.as_ref().unwrap();
             self.hc_pre(hca, t)?;
             self.rms(self.x.f32(), Some(&layer.attn_norm), self.xn.f32(), t, n)?;
@@ -1181,8 +1281,9 @@ impl Engine {
             cp(&self.s, bs.wrapping_add(o * hcn), streams, t * hcn)?;
         }
 
+        let layers = self.layers.clone();
         for il in 0..self.cfg.n_layer {
-            let layer: &Layer = unsafe { &*(&self.layers[il] as *const Layer) }; // layers are never mutated
+            let layer: &Layer = &layers[il];
             let (hca, hcf) = layer.hc.as_ref().unwrap();
             let is_moe = matches!(layer.ffn, Ffn::Moe { .. });
             let mut routes: Vec<Vec<(u16, f32)>> = Vec::with_capacity(if is_moe { len } else { 0 });
@@ -1385,9 +1486,10 @@ impl Engine {
         } else {
             self.pend_n = 0;
         }
-        if rows > 0 {
+        // a pending row plus a full chunk is chunk+1 rows: the scratch holds `chunk`, so split (E1)
+        for (off, cnt) in mtp_feed_parts(rows, self.chunk) {
             let p = self.mtp_pos;
-            self.mtp_rows(hall.wrapping_add(first_row * n), &htoks, p, false)?;
+            self.mtp_rows(hall.wrapping_add((first_row + off) * n), &htoks[off..off + cnt], p, false)?;
         }
         Ok(())
     }
@@ -1395,6 +1497,7 @@ impl Engine {
     /// The MTP block over `rows.len()` rows: inputs h (device, [rows][n]) and next tokens.
     /// Writes its attention cache at positions p..p+rows. Returns logits of the last row if asked.
     fn mtp_rows(&mut self, h: *const f32, toks: &[u32], p: usize, want: bool) -> Result<Option<Vec<f32>>> {
+        let t_m = Instant::now();
         let n = self.cfg.n_embd;
         let t = toks.len();
         let il = self.cfg.n_layer;
@@ -1411,10 +1514,10 @@ impl Engine {
         self.mm_s(&hi, dh, n, self.x.f32(), n, t, true)?;
         let saved_p0 = self.p0;
         self.p0 = p;
-        let layer = &self.layers[il];
+        let layers = self.layers.clone();
+        let layer = &layers[il];
         self.rms(self.x.f32(), Some(&layer.attn_norm), self.xn.f32(), t, n)?;
         let Attn::Mla(w) = &layer.attn else { bail!("MTP layer is not MLA") };
-        let w: &MlaW = unsafe { &*(w.as_ref() as *const MlaW) };
         self.mla(il, w, t)?;
         // residual: x += attn_out ; FFN on rmsnorm(x) ; x += ffn
         ck!(ffi::gs_axpy(self.x.f32(), self.out.f32(), 1.0, (t * n) as i64, self.s.raw()));
@@ -1425,6 +1528,7 @@ impl Engine {
         self.p0 = saved_p0;
         self.mtp_pos = p + t;
         if !want {
+            self.timings.mtp += t_m.elapsed();
             return Ok(None);
         }
         let last = self.x.f32().wrapping_add((t - 1) * n);
@@ -1433,6 +1537,7 @@ impl Engine {
         let mut l = vec![0f32; self.cfg.n_vocab];
         self.logits.download(0, bytes_of_mut(&mut l), &self.s)?;
         self.s.sync()?;
+        self.timings.mtp += t_m.elapsed();
         Ok(Some(l))
     }
 
@@ -1475,5 +1580,93 @@ impl Engine {
         unsafe { self.s.d2d(self.pend.ptr(), self.hid.f32().wrapping_add(i * n) as _, n * 4)? };
         self.pend_n = 1;
         Ok(())
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // kernels / copies may still be queued (error paths): let them finish before the device and
+        // pinned buffers they use are freed with the fields (F2); the expert cache then joins its
+        // reader threads in its own Drop (E4)
+        let _ = self.s.sync();
+        let _ = self.copy.sync();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn e1_mtp_feed_split_never_exceeds_chunk() {
+        assert_eq!(mtp_feed_parts(0, 32), vec![]);
+        assert_eq!(mtp_feed_parts(5, 32), vec![(0, 5)]);
+        assert_eq!(mtp_feed_parts(32, 32), vec![(0, 32)]);
+        // pending row + full chunk: first row alone, then the chunk
+        assert_eq!(mtp_feed_parts(33, 32), vec![(0, 1), (1, 32)]);
+        for chunk in 1..40 {
+            for rows in 0..=chunk + 1 {
+                let p = mtp_feed_parts(rows, chunk);
+                assert!(p.iter().all(|&(_, c)| c >= 1 && c <= chunk));
+                let mut next = 0;
+                for &(o, c) in &p {
+                    assert_eq!(o, next);
+                    next += c;
+                }
+                assert_eq!(next, rows);
+            }
+        }
+    }
+
+    fn blob(n: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = n.to_le_bytes().to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn x2_get_bytes_truncated_is_error() {
+        assert_eq!(get_bytes(&mut &blob(3, b"abc")[..]).unwrap(), b"abc");
+        assert!(get_bytes(&mut &blob(10, b"abc")[..]).is_err());
+        assert!(get_bytes(&mut &[1u8, 2][..]).is_err());
+    }
+
+    #[test]
+    fn x2_get_bytes_oversized_is_error() {
+        // a huge length prefix must neither allocate nor panic
+        assert!(get_bytes(&mut &blob(MAX_BLOB + 1, b"x")[..]).is_err());
+        assert!(get_bytes(&mut &blob(u64::MAX, b"x")[..]).is_err());
+        assert!(get_bytes(&mut &blob(MAX_BLOB, b"xyz")[..]).is_err());
+    }
+
+    #[test]
+    fn x2_snapshot_read_from_truncated_and_oversized() {
+        let snap = Snapshot { pos: 7, mtp_pos: 6, pend_n: 1, data: vec![vec![1, 2, 3], vec![4; 10]] };
+        let mut buf = Vec::new();
+        snap.write_to(&mut buf).unwrap();
+        let back = Snapshot::read_from(&mut &buf[..]).unwrap();
+        assert_eq!((back.pos, back.mtp_pos, back.pend_n), (7, 6, 1));
+        assert_eq!(back.data, snap.data);
+        for cut in 0..buf.len() {
+            assert!(Snapshot::read_from(&mut &buf[..cut]).is_err(), "cut at {cut}");
+        }
+        // blob count far too large
+        let mut bad = buf.clone();
+        bad[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Snapshot::read_from(&mut &bad[..]).is_err());
+        // pend_n must be 0 or 1
+        let mut bad = buf.clone();
+        bad[16..24].copy_from_slice(&5u64.to_le_bytes());
+        assert!(Snapshot::read_from(&mut &bad[..]).is_err());
+    }
+
+    #[test]
+    fn x2_snapshot_layout_must_match_buffers() {
+        let snap = Snapshot { pos: 0, mtp_pos: 0, pend_n: 0, data: vec![vec![0; 4], vec![0; 8]] };
+        assert!(check_snapshot_layout(&snap, &[4, 8]).is_ok());
+        assert!(check_snapshot_layout(&snap, &[4, 7]).is_err());
+        assert!(check_snapshot_layout(&snap, &[4, 9]).is_err());
+        assert!(check_snapshot_layout(&snap, &[4]).is_err());
+        assert!(check_snapshot_layout(&snap, &[4, 8, 2]).is_err());
     }
 }

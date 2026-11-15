@@ -112,10 +112,23 @@ impl GgmlType {
         }
     }
 
+    /// Bytes of a row of `n` elements. The caller guarantees `n` is a block multiple: the GGUF
+    /// parser rejects tensors whose rows are not, and the engine validates every other size it
+    /// passes at load time. Use [`try_row_bytes`](Self::try_row_bytes) for unchecked input.
     pub fn row_bytes(self, n: u64) -> u64 {
         let (be, bb) = self.block();
         assert!(n % be == 0, "{self:?}: row of {n} not a multiple of block {be}");
         n / be * bb
+    }
+
+    /// Bytes of a row of `n` elements; None if `n` is not a whole number of blocks or the size
+    /// overflows (G3).
+    pub fn try_row_bytes(self, n: u64) -> Option<u64> {
+        let (be, bb) = self.block();
+        if n % be != 0 {
+            return None;
+        }
+        (n / be).checked_mul(bb)
     }
 
     pub fn bits_per_weight(self) -> f64 {

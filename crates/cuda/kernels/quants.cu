@@ -19,24 +19,30 @@ __global__ void k_dequant(const uint8_t *__restrict__ src, int64_t n_groups, T *
 
 // n = number of elements (multiple of the block size)
 GS_EXPORT int gs_dequant_f32(int type, const void *src, int64_t n, float *dst, void *stream) {
+    if (n <= 0 || n % 8 != 0) return (int) cudaErrorInvalidValue;
     const int64_t ng = n / 8;
     const int threads = 256;
     const unsigned blocks = (unsigned) ((ng + threads - 1) / threads);
+    bool bad_n = false;
     bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        if (n % Q::QK != 0) { bad_n = true; return; }
         k_dequant<Q, float><<<blocks, threads, Q::SMEM, (cudaStream_t) stream>>>((const uint8_t *) src, ng, dst);
     });
-    if (!ok) return (int) cudaErrorInvalidValue;
+    if (!ok || bad_n) return (int) cudaErrorInvalidValue;
     return (int) cudaGetLastError();
 }
 
 GS_EXPORT int gs_dequant_f16(int type, const void *src, int64_t n, __half *dst, void *stream) {
+    if (n <= 0 || n % 8 != 0) return (int) cudaErrorInvalidValue;
     const int64_t ng = n / 8;
     const int threads = 256;
     const unsigned blocks = (unsigned) ((ng + threads - 1) / threads);
+    bool bad_n = false;
     bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        if (n % Q::QK != 0) { bad_n = true; return; }
         k_dequant<Q, __half><<<blocks, threads, Q::SMEM, (cudaStream_t) stream>>>((const uint8_t *) src, ng, dst);
     });
-    if (!ok) return (int) cudaErrorInvalidValue;
+    if (!ok || bad_n) return (int) cudaErrorInvalidValue;
     return (int) cudaGetLastError();
 }
 
@@ -372,26 +378,32 @@ static unsigned moe_blocks(int rows, int smem) {
 GS_EXPORT int gs_moe_gateup(int type, const MoeBatch *b, int nt, int64_t row_stride, int K, int rows, const float *x,
                             float *h, float lim, void *s) {
     if (b->n <= 0 || b->n > MOE_MAX || nt < 1 || nt > MOE_NT) return (int) cudaErrorInvalidValue;
+    if (K <= 0 || rows <= 0 || K % 8 != 0) return (int) cudaErrorInvalidValue;
+    bool bad_k = false;
     bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        if (K % Q::QK != 0) { bad_k = true; return; }
         dim3 grid(moe_blocks(rows, Q::SMEM), b->n);
         if (nt == 1)
             k_moe_gateup<Q, 1><<<grid, GEMV_WARPS * 32, Q::SMEM, (cudaStream_t) s>>>(*b, row_stride, K, rows, x, h, lim);
         else
             k_moe_gateup<Q, 2><<<grid, GEMV_WARPS * 32, Q::SMEM, (cudaStream_t) s>>>(*b, row_stride, K, rows, x, h, lim);
     });
-    if (!ok) return (int) cudaErrorInvalidValue;
+    if (!ok || bad_k) return (int) cudaErrorInvalidValue;
     return (int) cudaGetLastError();
 }
 GS_EXPORT int gs_moe_down(int type, const MoeBatch *b, int nt, int64_t row_stride, int K, int rows, const float *h, float *y,
                           void *s) {
     if (b->n <= 0 || b->n > MOE_MAX || nt < 1 || nt > MOE_NT) return (int) cudaErrorInvalidValue;
+    if (K <= 0 || rows <= 0 || K % 8 != 0) return (int) cudaErrorInvalidValue;
+    bool bad_k = false;
     bool ok = gs_dispatch_type(type, [&]<class Q>() {
+        if (K % Q::QK != 0) { bad_k = true; return; }
         const unsigned blocks = moe_blocks(rows, Q::SMEM);
         if (nt == 1)
             k_moe_down<Q, 1><<<blocks, GEMV_WARPS * 32, Q::SMEM, (cudaStream_t) s>>>(*b, row_stride, K, rows, h, y);
         else
             k_moe_down<Q, 2><<<blocks, GEMV_WARPS * 32, Q::SMEM, (cudaStream_t) s>>>(*b, row_stride, K, rows, h, y);
     });
-    if (!ok) return (int) cudaErrorInvalidValue;
+    if (!ok || bad_k) return (int) cudaErrorInvalidValue;
     return (int) cudaGetLastError();
 }

@@ -1,6 +1,6 @@
 [package]
 name = "quants"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "CPU reference (de)quantization for the GGML types used by GLM-5.3-Flash GGUFs"
 

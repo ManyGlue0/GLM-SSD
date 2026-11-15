@@ -140,7 +140,7 @@ pub struct ExpertPtrs {
 
 struct Req {
     id: u64,
-    reads: Vec<(usize, u64, usize, usize)>, // shard, aligned file offset, aligned length, dst address
+    reads: Vec<Extent>,
 }
 #[derive(Default)]
 struct IoQueue {
@@ -153,6 +153,19 @@ struct IoQueue {
     busy: Duration,
     busy_since: Option<Instant>,
 }
+/// One read: shard, aligned file offset, aligned length, dst address, bytes from the start of the
+/// window that must be present (the window may run past EOF; the wanted bytes may not, E5).
+type Extent = (usize, u64, usize, usize, usize);
+
+/// A read that stopped (EOF) before the bytes the expert needs is an error, not stale slot bytes.
+fn check_read_len(got: u64, need: usize, shard: usize, off: u64) -> Result<u64, String> {
+    if got < need as u64 {
+        Err(format!("short read in shard {shard} @ {off}: {got} of {need} bytes (file truncated?)"))
+    } else {
+        Ok(got)
+    }
+}
+
 struct IoPool {
     q: Arc<(Mutex<IoQueue>, Condvar)>,
     done: mpsc::Receiver<(u64, Result<u64, String>)>,
@@ -210,9 +223,9 @@ impl IoPool {
                             picked
                         };
                         let mut res = Ok(0u64);
-                        for &(shard, off, len, dst) in &req.reads {
+                        for &(shard, off, len, dst, need) in &req.reads {
                             let buf = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
-                            match read_direct(&files[shard], off, buf) {
+                            match read_direct(&files[shard], off, buf).map_err(|e| e.to_string()).and_then(|n| check_read_len(n, need, shard, off)) {
                                 Ok(n) => res = res.map(|t| t + n),
                                 Err(e) => {
                                     res = Err(format!("read shard {shard} @ {off}: {e}"));
@@ -239,7 +252,7 @@ impl IoPool {
     }
     /// Queue the reads of one expert; each extent is its own request so the slices of one
     /// expert load in parallel. Completion messages arrive once per extent.
-    fn submit(&mut self, reads: Vec<(usize, u64, usize, usize)>, hi: bool) -> u64 {
+    fn submit(&mut self, reads: Vec<Extent>, hi: bool) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let (m, cv) = &*self.q;
@@ -266,16 +279,26 @@ impl IoPool {
         }
     }
 }
-impl Drop for IoPool {
-    fn drop(&mut self) {
+impl IoPool {
+    /// Stop the reader threads and wait for them: a read being executed completes, queued ones are
+    /// dropped. After this returns no thread writes into any destination buffer (E4). Idempotent.
+    fn shutdown(&mut self) {
         {
             let (m, cv) = &*self.q;
-            m.lock().unwrap().quit = true;
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            g.quit = true;
+            g.hi.clear();
+            g.lo.clear();
             cv.notify_all();
         }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+    }
+}
+impl Drop for IoPool {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -354,6 +377,35 @@ pub struct ExpertCache {
     pub packed_file: Option<usize>,
 }
 unsafe impl Send for ExpertCache {}
+/// Parse a hot-expert profile (`tokens N` + `layer expert count` lines). Entries for which
+/// `valid(layer, expert)` is false (no such MoE layer / expert id out of range) are skipped (E2).
+fn parse_profile(text: &str, valid: impl Fn(u16, u16) -> bool) -> (u64, HashMap<Key, u64>) {
+    let mut tokens = 0u64;
+    let mut counts = HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next(), it.next()) {
+            (Some("tokens"), Some(n), None) => tokens = n.parse().unwrap_or(0),
+            (Some(l), Some(e), Some(n)) => {
+                if let (Ok(l), Ok(e), Ok(n)) = (l.parse::<u16>(), e.parse::<u16>(), n.parse::<u64>()) {
+                    if valid(l, e) {
+                        counts.insert((l, e), n);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (tokens, counts)
+}
+
+impl Drop for ExpertCache {
+    fn drop(&mut self) {
+        // the reader threads write into the pinned slots of `classes` through raw addresses: stop
+        // and join them before any field (and with it those buffers) is freed (E4)
+        self.io.shutdown();
+    }
+}
 
 pub struct CacheConfig {
     /// predicted experts prefetched per layer during decode (0 = off)
@@ -377,7 +429,7 @@ impl ExpertCache {
         for &il in moe_layers {
             let get = |n: &str| g.tensor(&format!("blk.{il}.{n}")).cloned().with_context(|| format!("blk.{il}.{n} missing"));
             let infos = [get("ffn_gate_exps.weight")?, get("ffn_up_exps.weight")?, get("ffn_down_exps.weight")?];
-            let pers = [0, 1, 2].map(|i| infos[i].n_bytes / infos[i].dims[2]);
+            let pers = [crate::repack::expert_per(&infos[0])?, crate::repack::expert_per(&infos[1])?, crate::repack::expert_per(&infos[2])?];
             let class = match class_sizes.iter().position(|c| *c == pers) {
                 Some(c) => c,
                 None => {
@@ -520,11 +572,13 @@ impl ExpertCache {
         *self.counts.entry(k).or_insert(0) += 1;
     }
 
-    fn reads_for(&self, layer: usize, e: u16, dst: *mut u8) -> Vec<(usize, u64, usize, usize)> {
+    fn reads_for(&self, layer: usize, e: u16, dst: *mut u8) -> Vec<Extent> {
         let lay = &self.layouts[&layer];
         if let (Some(pl), Some(fi)) = (lay.packed, self.packed_file) {
             let per = [0, 1, 2].map(|i| lay.parts[i].per);
-            return vec![(fi, pl.offset + e as u64 * pl.stride, repack::record_len(per), dst as usize)];
+            let (regions, _) = repack::slot_layout(per);
+            let need = regions[2] + per[2] as usize;
+            return vec![(fi, pl.offset + e as u64 * pl.stride, repack::record_len(per), dst as usize, need)];
         }
         lay.parts
             .iter()
@@ -532,7 +586,7 @@ impl ExpertCache {
                 let off = p.info.offset + e as u64 * p.per;
                 let a = off / ALIGN * ALIGN;
                 let len = (off + p.per).div_ceil(ALIGN) * ALIGN - a;
-                (p.info.shard, a, len as usize, dst as usize + p.region)
+                (p.info.shard, a, len as usize, dst as usize + p.region, (off + p.per - a) as usize)
             })
             .collect()
     }
@@ -969,19 +1023,10 @@ impl ExpertCache {
     // ---- hot-expert profile -----------------------------------------------------------------------
     fn load_profile(&mut self, p: &Path) -> Result<()> {
         let text = std::fs::read_to_string(p).with_context(|| format!("reading profile {}", p.display()))?;
-        let mut tokens = 0u64;
-        for line in text.lines() {
-            let mut it = line.split_whitespace();
-            match (it.next(), it.next(), it.next()) {
-                (Some("tokens"), Some(n), None) => tokens = n.parse().unwrap_or(0),
-                (Some(l), Some(e), Some(n)) => {
-                    if let (Ok(l), Ok(e), Ok(n)) = (l.parse::<u16>(), e.parse::<u16>(), n.parse::<u64>()) {
-                        self.counts.insert((l, e), n);
-                    }
-                }
-                _ => {}
-            }
-        }
+        let n_expert = self.ram_map.n_expert;
+        let layouts = &self.layouts;
+        let (tokens, counts) = parse_profile(&text, |l, e| layouts.contains_key(&(l as usize)) && (e as usize) < n_expert);
+        self.counts.extend(counts);
         self.profile_tokens = tokens;
         // prior score: expected uses over ~a half-life worth of tokens, relative to this expert's share
         let per_layer: HashMap<u16, u64> = self.counts.iter().fold(HashMap::new(), |mut m, (k, v)| {
@@ -1023,5 +1068,81 @@ impl ExpertCache {
             s.prefetch_useful,
             s.prefetch_issued
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str, len: usize) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("glmssd-test-{}-{name}", std::process::id()));
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    #[test]
+    fn e4_iopool_shutdown_joins_readers_before_buffers_go() {
+        let p = temp_file("e4", 4 << 20);
+        let mut pool = IoPool::new(std::slice::from_ref(&p), 4, false).unwrap();
+        let n_req = 64;
+        let len = 1 << 20;
+        let mut bufs: Vec<Vec<u8>> = (0..n_req).map(|_| vec![0u8; len]).collect();
+        for (i, b) in bufs.iter_mut().enumerate() {
+            let off = ((i % 4) * len) as u64;
+            pool.submit(vec![(0, off, len, b.as_mut_ptr() as usize, len)], i % 2 == 0);
+        }
+        pool.shutdown();
+        assert!(pool.threads.is_empty());
+        {
+            let g = pool.q.0.lock().unwrap();
+            assert_eq!(g.inflight, 0, "a read is still executing after shutdown");
+            assert!(g.hi.is_empty() && g.lo.is_empty());
+        }
+        // every reader thread is gone: once the finished reads are drained the channel is closed
+        let mut done = 0;
+        loop {
+            match pool.done.try_recv() {
+                Ok((_, r)) => {
+                    assert_eq!(r.unwrap(), len as u64);
+                    done += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => panic!("a reader thread is still alive"),
+            }
+        }
+        assert!(done <= n_req);
+        pool.shutdown(); // idempotent
+        drop(pool);
+        drop(bufs);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn e2_profile_entries_out_of_range_are_skipped() {
+        let text = "tokens 100\n3 5 7\n3 300 9\n9 1 4\n65535 65535 1\nbad line\n4 2 x\n";
+        let (tokens, counts) = parse_profile(text, |l, e| (l == 3 || l == 4) && e < 256);
+        assert_eq!(tokens, 100);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[&(3, 5)], 7);
+    }
+
+    #[test]
+    fn e5_short_read_is_an_error() {
+        assert_eq!(check_read_len(4096, 4000, 0, 0), Ok(4096));
+        assert_eq!(check_read_len(4000, 4000, 0, 0), Ok(4000));
+        assert!(check_read_len(3999, 4000, 0, 0).is_err());
+        assert!(check_read_len(0, 1, 2, 4096).is_err());
+        // a real truncated file: the window may run past EOF, the wanted bytes may not
+        let p = temp_file("e5", 6000);
+        let f = File::open(&p).unwrap();
+        let mut buf = vec![0u8; 8192];
+        let got = read_direct(&f, 0, &mut buf).unwrap();
+        assert_eq!(got, 6000);
+        assert!(check_read_len(got, 5000, 0, 0).is_ok());
+        assert!(check_read_len(got, 7000, 0, 0).is_err());
+        drop(f);
+        let _ = std::fs::remove_file(&p);
     }
 }

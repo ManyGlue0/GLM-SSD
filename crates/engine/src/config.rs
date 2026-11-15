@@ -79,7 +79,7 @@ impl Config {
 
         let n_total = u("block_count")?;
         let n_layer_nextn = u("nextn_predict_layers").unwrap_or(0);
-        let n_layer = n_total - n_layer_nextn;
+        let n_layer = n_total.checked_sub(n_layer_nextn).context("nextn_predict_layers > block_count")?;
 
         let kv_heads = g.get(&k("attention.head_count_kv")).and_then(Value::as_arr).context("head_count_kv array")?;
         if kv_heads.len() != n_total {

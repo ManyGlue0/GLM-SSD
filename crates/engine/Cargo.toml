@@ -1,6 +1,6 @@
 [package]
 name = "glm-ssd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "SSD-streaming MoE inference engine for GLM-5.3-Flash"
 license = "MIT"
@@ -33,4 +33,6 @@ indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+# OS random numbers (park-file names, per-request nonces); already in the dependency tree
+getrandom = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }

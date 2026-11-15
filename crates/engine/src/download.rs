@@ -163,8 +163,14 @@ async fn download(args: DownloadArgs, models: &Path) -> Result<()> {
         bail!("no files in {} match {:?}", args.repo, args.include);
     }
     files.sort_by_key(|e| e.size); // small files first -> metadata available early
-
-    let total: u64 = files.iter().map(|f| f.size).sum();
+    // the listing is untrusted when the repo is third-party: validate every path and size (D1, D2)
+    for f in &files {
+        safe_rel_path(&f.path)?;
+        if f.size > MAX_FILE {
+            bail!("{}: implausible size {} bytes in the repo listing", f.path, f.size);
+        }
+    }
+    let total: u64 = files.iter().try_fold(0u64, |a, f| a.checked_add(f.size)).context("repo listing sizes overflow")?;
     println!(
         "{} @ {}: {} file(s), {:.2} GB total -> {}",
         args.repo,
@@ -182,12 +188,15 @@ async fn download(args: DownloadArgs, models: &Path) -> Result<()> {
     }
 
     // ---- prepare jobs / resume state ---------------------------------------------------
-    let chunk_size = args.chunk_mb.max(1) << 20;
+    let chunk_size = args.chunk_mb.clamp(1, 4096) << 20;
     let mut queue = VecDeque::new();
     let mut jobs = Vec::new();
     let mut already = 0u64;
     for e in files {
-        let final_path = out.join(&e.path);
+        let final_path = out.join(safe_rel_path(&e.path)?);
+        if !final_path.starts_with(&out) {
+            bail!("refusing to write {} outside {}", e.path, out.display());
+        }
         if let Some(p) = final_path.parent() {
             std::fs::create_dir_all(p)?;
         }
@@ -204,7 +213,7 @@ async fn download(args: DownloadArgs, models: &Path) -> Result<()> {
         let mut state = std::fs::read(&state_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<PartState>(&b).ok())
-            .filter(|s| s.size == e.size && s.sha256 == sha && s.done.len() as u64 == s.size.div_ceil(s.chunk_size).max(1))
+            .filter(|s| part_state_valid(s, e.size, &sha))
             .filter(|_| part_path.exists());
         if state.is_none() {
             let _ = std::fs::remove_file(&part_path);
@@ -456,6 +465,58 @@ fn pick_model(repo: &str, entries: &[TreeEntry]) -> Result<Vec<String>> {
     bail!("{}", msg.trim_end())
 }
 
+/// Largest single file accepted from a repo listing (4 TiB; keeps the chunk bitmap small).
+const MAX_FILE: u64 = 1 << 42;
+
+/// Validate a repo path from the Hugging Face API before it becomes a local path (D1): relative,
+/// `/`-separated, no empty / `.` / `..` components, no characters or names Windows treats
+/// specially (drive or stream `:`, `\`, wildcards, device names, trailing dot / space).
+fn safe_rel_path(p: &str) -> Result<PathBuf> {
+    let bad = |why: &str| -> Result<PathBuf> { bail!("unsafe file path {p:?} in the repo listing ({why})") };
+    if p.is_empty() {
+        return bad("empty");
+    }
+    let mut out = PathBuf::new();
+    for c in p.split('/') {
+        if c.is_empty() || c == "." || c == ".." {
+            return bad("empty, . or .. component");
+        }
+        if let Some(ch) = c.chars().find(|ch| matches!(ch, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control()) {
+            return bad(&format!("character {ch:?}"));
+        }
+        if c.starts_with(' ') || c.ends_with(' ') || c.ends_with('.') {
+            return bad("component starts/ends with a space or ends with a dot");
+        }
+        let stem = c.split('.').next().unwrap_or(c).trim_end().to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        if device {
+            return bad("Windows device name");
+        }
+        out.push(c);
+    }
+    // belt and braces: what we built must be a plain relative path
+    if out.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return bad("not a plain relative path");
+    }
+    Ok(out)
+}
+
+/// A resume state is usable only if it describes this exact file with a sane chunking (D3).
+fn part_state_valid(s: &PartState, size: u64, sha: &Option<String>) -> bool {
+    s.size == size
+        && s.sha256 == *sha
+        && s.chunk_size > 0
+        && s.chunk_size <= 4096 << 20
+        && s.done.len() as u64 == s.size.div_ceil(s.chunk_size).max(1)
+}
+
+/// The HF token goes only to https://huggingface.co itself (D4), never to other hosts (CDN
+/// redirects, pagination links pointing elsewhere, look-alike prefixes such as huggingface.co.evil).
+fn token_allowed(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str() == Some("huggingface.co") && u.username().is_empty())
+}
+
 fn chunk_len(size: u64, cs: u64, idx: usize) -> u64 {
     let start = idx as u64 * cs;
     (size - start).min(cs)
@@ -501,7 +562,7 @@ async fn list_tree(api: &reqwest::Client, repo: &str, rev: &str, token: Option<&
     let mut out = Vec::new();
     while let Some(u) = url.take() {
         let mut rq = api.get(&u);
-        if let Some(t) = token {
+        if let Some(t) = token.filter(|_| token_allowed(&u)) {
             rq = rq.bearer_auth(t);
         }
         let resp = rq.send().await?.error_for_status().context("listing repo tree")?;
@@ -529,7 +590,7 @@ async fn file_url(api: &reqwest::Client, repo: &str, rev: &str, token: Option<&s
     }
     let resolve = format!("{HF}/{repo}/resolve/{rev}/{}", job.repo_path);
     let mut rq = api.get(&resolve).header("Range", "bytes=0-0");
-    if let Some(t) = token {
+    if let Some(t) = token.filter(|_| token_allowed(&resolve)) {
         rq = rq.bearer_auth(t);
     }
     let resp = rq.send().await?;
@@ -565,7 +626,7 @@ async fn fetch_chunk(
 
     let url = file_url(cdn, repo, rev, token, job).await?;
     let mut rq = cdn.get(&url).header("Range", format!("bytes={start}-{end}"));
-    if url.starts_with(HF) {
+    if token_allowed(&url) {
         if let Some(t) = token {
             rq = rq.bearer_auth(t);
         }
@@ -680,4 +741,74 @@ fn rename_when_free(job: &Arc<FileJob>) -> Result<()> {
         }
     }
     Err(anyhow!("rename {} failed: {:?}", job.part_path.display(), last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn d1_valid_nested_path_is_accepted() {
+        assert_eq!(safe_rel_path("UD-IQ2_XXS/model-00001-of-00004.gguf").unwrap(), PathBuf::from("UD-IQ2_XXS").join("model-00001-of-00004.gguf"));
+        assert_eq!(safe_rel_path("README.md").unwrap(), PathBuf::from("README.md"));
+        assert!(safe_rel_path("a/.hidden/con-fig.txt").is_ok());
+        assert!(safe_rel_path("COM10/LPT0.txt").is_ok());
+    }
+
+    #[test]
+    fn d1_traversal_is_rejected() {
+        for p in ["../evil.dll", "a/../../evil", "a/./b", "/abs/path", "a//b", "a/", "", ".."] {
+            assert!(safe_rel_path(p).is_err(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn d1_backslash_drive_and_stream_are_rejected() {
+        for p in ["..\\..\\Windows\\evil.dll", "a\\b", "C:/Windows/evil.dll", "C:evil", "model.gguf:stream", "a/b:$DATA", "x*.gguf", "q?.gguf", "a\"b", "a<b", "a>b", "a|b", "a\u{1}b", "a\nb"] {
+            assert!(safe_rel_path(p).is_err(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn d1_device_names_and_trailing_dots_are_rejected() {
+        for p in ["CON", "con.txt", "a/nul", "Aux.gguf", "prn.tar.gz", "COM1", "com9.bin", "LPT3", "dir/lpt1.txt", "CONIN$", "conout$.txt", "a/Conin$", "a./b", "a/b.", "a/b ", " a/b", "nul .txt"] {
+            assert!(safe_rel_path(p).is_err(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn d3_bad_resume_state_is_rejected() {
+        let ok = PartState { size: 100, sha256: None, chunk_size: 64, done: vec![false; 2] };
+        assert!(part_state_valid(&ok, 100, &None));
+        assert!(!part_state_valid(&PartState { chunk_size: 0, done: vec![], ..ok }, 100, &None));
+        let ok = PartState { size: 100, sha256: None, chunk_size: 64, done: vec![false; 2] };
+        assert!(!part_state_valid(&PartState { done: vec![false; 3], ..ok }, 100, &None));
+        let ok = PartState { size: 100, sha256: None, chunk_size: 64, done: vec![false; 2] };
+        assert!(!part_state_valid(&ok, 101, &None));
+        assert!(!part_state_valid(&ok, 100, &Some("abc".into())));
+    }
+
+    #[test]
+    fn d4_token_only_for_huggingface_https() {
+        assert!(token_allowed("https://huggingface.co/api/models/a/b/tree/main?recursive=true"));
+        assert!(token_allowed("https://huggingface.co/a/b/resolve/main/x.gguf"));
+        for u in [
+            "http://huggingface.co/api",
+            "https://huggingface.co.evil.com/api",
+            "https://huggingface.com/api",
+            "https://cdn-lfs.huggingface.co/x",
+            "https://evil.com/?https://huggingface.co",
+            "https://huggingface.co@evil.com/x",
+            "https://user@huggingface.co/x",
+            "not a url",
+        ] {
+            assert!(!token_allowed(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn d2_size_sum_is_checked() {
+        let sizes = [u64::MAX, 2];
+        assert!(sizes.iter().try_fold(0u64, |a, &s| a.checked_add(s)).is_none());
+    }
 }
